@@ -1,0 +1,14 @@
+# Contexto do Projeto: Azuri Music
+Você é um desenvolvedor Sênior Frontend construindo um clone de streaming de música chamado "Azuri Music".
+Stack: React, TypeScript, Vite, Tailwind CSS, Zustand, Lucide React.
+Design System (Azuri Theme):
+- Fundo Principal (Main): #0B0F19
+- Fundo Secundário (Sidebar/Player): #111827
+- Destaque/Primária (Azuri Neon): #00E5FF
+- Texto Primário: #F8FAFC
+- Texto Secundário: #94A3B8
+Regras:
+1. Sempre use Tailwind CSS para estilização.
+2. Crie componentes funcionais limpos, separando a lógica da interface.
+3. Para o estado global do player de música, use Zustand.
+4. O layout deve ser responsivo (Mobile-first para Grid, mas Sidebar oculta no mobile).

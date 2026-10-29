@@ -1,0 +1,25 @@
+@import "tailwindcss";
+
+@theme {
+  --color-azuri-main: #0b0f19;
+  --color-azuri-secondary: #111827;
+  --color-azuri-neon: #00e5ff;
+  --color-azuri-text: #f8fafc;
+  --color-azuri-muted: #94a3b8;
+  --color-azuri-gradient-from: #1e293b;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background-color: var(--color-azuri-main);
+  color: var(--color-azuri-text);
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
