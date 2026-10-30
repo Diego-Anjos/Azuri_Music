@@ -2,24 +2,30 @@ import { create } from 'zustand'
 
 const RESOLVE_URL = 'http://localhost:3001/api/stream'
 
-export interface Track {
+export interface PlayerTrack {
   id: string
-  title: string
-  artist: string
-  coverUrl: string
-  duration: number
+  name: string
+  artists: Array<{ name: string }>
+  album?: {
+    name?: string
+    release_date?: string
+    images?: Array<{ url: string }> | null
+  } | null
+  duration_ms?: number
 }
 
 interface PlayerState {
-  currentTrack: Track | null
+  currentTrack: PlayerTrack | null
   youtubeVideoId: string | null
   isPlaying: boolean
   volume: number
   progress: number
-  playTrack: (track: Track) => Promise<void>
+  duration: number
+  playTrack: (track: PlayerTrack) => Promise<void>
   togglePlay: () => void
   setVolume: (value: number) => void
-  setProgress: (seconds: number) => void
+  setProgress: (value: number) => void
+  setDuration: (value: number) => void
   handleNextTrack: () => void
 }
 
@@ -27,17 +33,20 @@ export const usePlayerStore = create<PlayerState>((set) => ({
   currentTrack: null,
   youtubeVideoId: null,
   isPlaying: false,
-  volume: 50,
+  volume: 0.5,
   progress: 0,
+  duration: 0,
   playTrack: async (track) => {
     set({
       currentTrack: track,
       youtubeVideoId: null,
       isPlaying: false,
       progress: 0,
+      duration: 0,
     })
 
-    const query = `${track.title} ${track.artist}`
+    const artistName = track.artists?.[0]?.name ?? ''
+    const query = `${track.name} ${artistName}`.trim()
 
     try {
       const response = await fetch(
@@ -68,7 +77,8 @@ export const usePlayerStore = create<PlayerState>((set) => ({
     }
   },
   togglePlay: () => set((state) => ({ isPlaying: !state.isPlaying })),
-  setVolume: (value) => set({ volume: value }),
-  setProgress: (seconds) => set({ progress: seconds }),
+  setVolume: (value) => set({ volume: Math.min(1, Math.max(0, value)) }),
+  setProgress: (value) => set({ progress: value }),
+  setDuration: (value) => set({ duration: value }),
   handleNextTrack: () => set({ isPlaying: false, progress: 0 }),
 }))

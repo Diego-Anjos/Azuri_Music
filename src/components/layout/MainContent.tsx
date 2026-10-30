@@ -1,50 +1,25 @@
-import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { Play } from 'lucide-react'
 import { PlaylistCard } from '../PlaylistCard'
-import {
-  getFeaturedPlaylists,
-  type SpotifyPlaylist,
-} from '../../services/spotify'
+import type { SpotifyPlaylist } from '../../services/spotify'
 
 const ICON_STROKE = 1.5
 
-export function MainContent() {
-  const [playlists, setPlaylists] = useState<SpotifyPlaylist[]>([])
-  const [isLoading, setIsLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
+interface MainContentProps {
+  recentPlaylists: SpotifyPlaylist[]
+  mixPlaylists: SpotifyPlaylist[]
+  electronicPlaylists: SpotifyPlaylist[]
+  isLoading: boolean
+  error: string | null
+}
 
-  useEffect(() => {
-    let cancelled = false
-
-    async function loadPlaylists() {
-      try {
-        setIsLoading(true)
-        setError(null)
-        const data = await getFeaturedPlaylists()
-        if (!cancelled) setPlaylists(data)
-      } catch (err) {
-        if (!cancelled) {
-          setError(
-            err instanceof Error ? err.message : 'Erro ao carregar playlists',
-          )
-        }
-      } finally {
-        if (!cancelled) setIsLoading(false)
-      }
-    }
-
-    loadPlaylists()
-
-    return () => {
-      cancelled = true
-    }
-  }, [])
-
-  const recentShortcuts = playlists.slice(0, 6)
-  const mixedForYou = playlists.slice(0, Math.ceil(playlists.length / 2))
-  const missedSongs = playlists.slice(Math.ceil(playlists.length / 2))
-
+export function MainContent({
+  recentPlaylists,
+  mixPlaylists,
+  electronicPlaylists,
+  isLoading,
+  error,
+}: MainContentProps) {
   return (
     <main className="flex min-h-0 flex-1 flex-col overflow-y-auto bg-gradient-to-b from-[#1E293B] to-[#0B0F19]">
       <header className="px-4 pb-2 pt-6 md:px-8">
@@ -67,7 +42,7 @@ export function MainContent() {
                 Atalhos recentes
               </h3>
               <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 xl:grid-cols-3">
-                {recentShortcuts.map((playlist) => (
+                {recentPlaylists.map((playlist) => (
                   <Link
                     key={`shortcut-${playlist.id}`}
                     to={`/playlist/${playlist.id}`}
@@ -97,14 +72,11 @@ export function MainContent() {
               </div>
             </section>
 
-            <PlaylistCarousel
-              title="Mixado para ti"
-              playlists={mixedForYou}
-            />
+            <PlaylistCarousel title="Mixado para ti" playlists={mixPlaylists} />
 
             <PlaylistCarousel
               title="Suas músicas estão com saudade"
-              playlists={missedSongs.length > 0 ? missedSongs : mixedForYou}
+              playlists={electronicPlaylists}
             />
           </>
         )}

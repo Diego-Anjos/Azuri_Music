@@ -11,7 +11,7 @@ import { Link, useLocation } from 'react-router-dom'
 
 const navItems = [
   { id: 'home', label: 'Home', icon: Home, to: '/' },
-  { id: 'search', label: 'Search', icon: Search, to: '/' },
+  { id: 'search', label: 'Search', icon: Search, to: '/search' },
   { id: 'library', label: 'Library', icon: Library, to: '/' },
 ] as const
 
@@ -78,7 +78,6 @@ const ICON_STROKE = 1.5
 
 export function Sidebar() {
   const location = useLocation()
-  const isHome = location.pathname === '/'
 
   return (
     <aside className="hidden h-full w-64 shrink-0 flex-col bg-[#0B0F19] md:flex">
@@ -92,7 +91,10 @@ export function Sidebar() {
 
         <nav className="flex flex-col gap-1">
           {navItems.map(({ id, label, icon: Icon, to }) => {
-            const isActive = id === 'home' ? isHome : false
+            const isActive =
+              id === 'home'
+                ? location.pathname === '/'
+                : location.pathname.startsWith(to) && to !== '/'
 
             return (
               <Link
