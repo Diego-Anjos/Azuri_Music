@@ -10,19 +10,18 @@ import {
   Smile,
   Volume2,
 } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import ReactPlayer from 'react-player/youtube'
+import { Link } from 'react-router-dom'
 import { usePlayerStore } from '../../store/usePlayerStore'
+import { TrackWaveform } from '../TrackWaveform'
+
+const ARTIST_LINK_CLASS =
+  'cursor-pointer text-sm text-gray-400 transition-colors hover:text-cyan-400 hover:underline'
 
 const ICON_STROKE = 1.5
 
 const REACTION_EMOJIS = ['🔥', '🚀', '🎵', '💙', '🤯'] as const
-
-const WAVEFORM_FILL = {
-  backgroundImage:
-    'repeating-linear-gradient(90deg, #22d3ee, #22d3ee 3px, transparent 3px, transparent 6px)',
-  backgroundColor: 'rgba(34, 211, 238, 0.25)',
-} as const
 
 function formatTime(seconds: number): string {
   if (!Number.isFinite(seconds) || seconds < 0) return '0:00'
@@ -39,12 +38,15 @@ export function MusicPlayer() {
     youtubeVideoId,
     progress,
     duration,
+    seekRequest,
     togglePlay,
     setVolume,
     setProgress,
     setDuration,
+    clearSeekRequest,
     handleNextTrack,
   } = usePlayerStore()
+  const playerRef = useRef<ReactPlayer | null>(null)
   const [liked, setLiked] = useState(false)
   const [isExpanded, setIsExpanded] = useState(false)
   const [showReactions, setShowReactions] = useState(false)
@@ -56,14 +58,42 @@ export function MusicPlayer() {
   const [repeat, setRepeat] = useState(false)
 
   const title = currentTrack?.name ?? 'Nenhuma música'
-  const artist =
-    currentTrack?.artists?.[0]?.name ?? 'Selecione uma faixa'
+  const artists = currentTrack?.artists ?? []
   const coverUrl = currentTrack?.album?.images?.[0]?.url
   const albumName = currentTrack?.album?.name
   const releaseDate = currentTrack?.album?.release_date
-  const progressPercent = Math.min(100, Math.max(0, progress * 100))
   const elapsedSeconds = duration > 0 ? progress * duration : 0
   const volumePercent = Math.round(volume * 100)
+
+  useEffect(() => {
+    if (seekRequest == null || !playerRef.current) return
+    playerRef.current.seekTo(seekRequest, 'fraction')
+    clearSeekRequest()
+  }, [seekRequest, clearSeekRequest])
+
+  function renderArtistLinks(options?: { onNavigate?: () => void }) {
+    if (artists.length === 0) {
+      return <span className="text-sm text-gray-400">Selecione uma faixa</span>
+    }
+
+    return artists.map((artist, index) => (
+      <span key={`${artist.id ?? artist.name}-${index}`}>
+        {index > 0 && <span className="text-sm text-gray-400">, </span>}
+        {artist.id ? (
+          <Link
+            to={`/artist/${artist.id}`}
+            state={{ artistName: artist.name }}
+            onClick={options?.onNavigate}
+            className={ARTIST_LINK_CLASS}
+          >
+            {artist.name}
+          </Link>
+        ) : (
+          <span className="text-sm text-gray-400">{artist.name}</span>
+        )}
+      </span>
+    ))
+  }
 
   useEffect(() => {
     if (!reactionToast) return
@@ -85,6 +115,7 @@ export function MusicPlayer() {
   return (
     <footer className="relative z-30 flex h-24 shrink-0 items-center justify-between gap-4 border-t border-gray-800 bg-[#0B0F19]/90 px-4 backdrop-blur-md md:px-6">
       <ReactPlayer
+        ref={playerRef}
         url={
           youtubeVideoId
             ? `https://www.youtube.com/watch?v=${youtubeVideoId}`
@@ -98,6 +129,7 @@ export function MusicPlayer() {
         width="0"
         height="0"
         className="hidden"
+        progressInterval={200}
       />
 
       {/* Esquerda — faixa + Now Playing */}
@@ -121,7 +153,9 @@ export function MusicPlayer() {
             </div>
           )}
           <h3 className="truncate text-lg font-bold text-white">{title}</h3>
-          <p className="mb-4 text-sm text-cyan-400">{artist}</p>
+          <p className="mb-4 truncate">
+            {renderArtistLinks({ onNavigate: () => setIsExpanded(false) })}
+          </p>
           <div className="space-y-2 border-t border-white/10 pt-3 text-xs">
             <div className="flex items-start justify-between gap-3">
               <span className="shrink-0 text-[#94A3B8]">Álbum</span>
@@ -151,7 +185,7 @@ export function MusicPlayer() {
           <p className="truncate text-sm font-medium text-[#F8FAFC] transition-colors hover:text-cyan-400">
             {title}
           </p>
-          <p className="truncate text-xs text-[#94A3B8]">{artist}</p>
+          <p className="truncate">{renderArtistLinks()}</p>
         </div>
         <button
           type="button"
@@ -257,14 +291,19 @@ export function MusicPlayer() {
           <span className="w-9 shrink-0 text-right text-[10px] tabular-nums text-[#94A3B8]">
             {formatTime(elapsedSeconds)}
           </span>
-          <div className="group relative h-5 flex-1 cursor-pointer overflow-hidden rounded-md bg-white/10 transition-transform hover:scale-y-110 sm:h-6">
-            <div
-              className="absolute inset-y-0 left-0 rounded-md"
-              style={{
-                width: `${progressPercent}%`,
-                ...WAVEFORM_FILL,
-              }}
-            />
+          <div className="group relative h-5 flex-1 overflow-hidden rounded-md bg-white/5 transition-transform hover:scale-y-110 sm:h-6">
+            {currentTrack ? (
+              <TrackWaveform
+                trackId={currentTrack.id}
+                trackName={currentTrack.name}
+                durationMs={currentTrack.duration_ms ?? duration * 1000}
+                barCount={72}
+                variant="player"
+                className="h-full"
+              />
+            ) : (
+              <div className="h-full w-full rounded-md bg-white/10" />
+            )}
           </div>
           <span className="w-9 shrink-0 text-[10px] tabular-nums text-[#94A3B8]">
             {formatTime(duration)}

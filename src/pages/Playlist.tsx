@@ -2,10 +2,44 @@ import { Clock3, Play } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { useParams } from 'react-router-dom'
 import {
+  getPlaylistById,
+  subscribeLibraryUpdates,
+} from '../services/libraryStorage'
+import {
   getPlaylistDetails,
   type SpotifyPlaylistDetails,
 } from '../services/spotify'
 import { usePlayerStore } from '../store/usePlayerStore'
+
+function toSpotifyPlaylistDetails(
+  local: NonNullable<ReturnType<typeof getPlaylistById>>,
+): SpotifyPlaylistDetails {
+  return {
+    id: local.id,
+    name: local.name,
+    description: 'Playlist local Azuri Music',
+    imageUrl: local.coverUrl,
+    ownerName: 'Você',
+    tracks: {
+      total: local.tracks.length,
+      items: local.tracks.map((track) => ({
+        track: {
+          id: track.id,
+          name: track.name,
+          duration_ms: track.duration_ms ?? 0,
+          artists: track.artists,
+          album: track.album
+            ? {
+                name: track.album.name,
+                release_date: track.album.release_date,
+                images: track.album.images ?? null,
+              }
+            : null,
+        },
+      })),
+    },
+  }
+}
 
 const ICON_STROKE = 1.5
 
@@ -78,8 +112,25 @@ export function Playlist() {
       try {
         setIsLoading(true)
         setError(null)
+
+        const local = getPlaylistById(id!)
+        if (local) {
+          if (!cancelled) {
+            setPlaylist(toSpotifyPlaylistDetails(local))
+            setIsLoading(false)
+          }
+          return
+        }
+
         const data = await getPlaylistDetails(id!)
-        if (!cancelled) setPlaylist(data)
+        if (!cancelled) {
+          if (!data) {
+            setPlaylist(null)
+            setError('Erro ao carregar playlist')
+          } else {
+            setPlaylist(data)
+          }
+        }
       } catch (err) {
         if (!cancelled) {
           setError(
@@ -93,14 +144,23 @@ export function Playlist() {
 
     void loadPlaylist()
 
+    const unsubscribe = subscribeLibraryUpdates(() => {
+      const local = getPlaylistById(id!)
+      if (local) setPlaylist(toSpotifyPlaylistDetails(local))
+    })
+
     return () => {
       cancelled = true
+      unsubscribe()
     }
   }, [id])
 
   const trackItems = playlist?.tracks?.items ?? []
   const trackCount =
     playlist?.tracks?.total ?? playlist?.tracks?.items?.length ?? 0
+  const playlistQueue = trackItems
+    .map((item) => item.track)
+    .filter((track): track is NonNullable<typeof track> => track != null)
 
   return (
     <main className="flex min-h-0 flex-1 flex-col overflow-y-auto bg-gradient-to-b from-[#1E293B] to-[#0B0F19]">
@@ -168,12 +228,12 @@ export function Playlist() {
                     role="button"
                     tabIndex={0}
                     onClick={() => {
-                      void playTrack(track)
+                      void playTrack(track, playlistQueue)
                     }}
                     onKeyDown={(event) => {
                       if (event.key === 'Enter' || event.key === ' ') {
                         event.preventDefault()
-                        void playTrack(track)
+                        void playTrack(track, playlistQueue)
                       }
                     }}
                     className="group grid cursor-pointer grid-cols-[32px_minmax(0,1fr)_72px] items-center gap-3 rounded-md px-3 py-2 transition-colors hover:bg-white/5 sm:grid-cols-[40px_minmax(0,2fr)_minmax(0,1fr)_72px]"
@@ -225,7 +285,8 @@ export function Playlist() {
 
             {trackItems.length === 0 && (
               <p className="px-3 pt-6 text-sm text-[#94A3B8]">
-                Esta playlist não tem faixas acessíveis via API no momento.
+                Esta playlist ainda não tem faixas. Use &quot;Adicionar à
+                Playlist&quot; numa faixa para começar.
               </p>
             )}
           </section>

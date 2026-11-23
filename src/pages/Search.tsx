@@ -126,7 +126,15 @@ export function Search() {
 
         {debouncedQuery && !isLoading && !error && hasResults && (
           <>
-            <TracksSection tracks={results.tracks} onPlay={playTrack} />
+            <TracksSection
+              tracks={results.tracks}
+              onPlay={(track) =>
+                playTrack(
+                  track,
+                  results.tracks.map((item) => toPlayerTrack(item)),
+                )
+              }
+            />
             <ArtistsSection artists={results.artists} />
             <PlaylistsSection playlists={results.playlists} />
           </>
@@ -136,11 +144,20 @@ export function Search() {
   )
 }
 
+const ARTIST_LINK_CLASS =
+  'cursor-pointer text-sm text-gray-400 transition-colors hover:text-cyan-400 hover:underline'
+
 function toPlayerTrack(track: SpotifyTrack): PlayerTrack {
   return {
     id: track.id,
     name: track.name,
-    artists: [{ name: track.artistName }],
+    artists:
+      track.artists.length > 0
+        ? track.artists.map((artist) => ({
+            id: artist.id,
+            name: artist.name,
+          }))
+        : [{ name: track.artistName }],
     album: {
       name: track.albumName,
       release_date: track.albumReleaseDate,
@@ -165,41 +182,70 @@ function TracksSection({
       <ul className="space-y-1">
         {tracks.map((track, index) => (
           <li key={track.id}>
-            <button
-              type="button"
-              onClick={() => void onPlay(toPlayerTrack(track))}
-              className="group flex w-full items-center gap-3 rounded-md px-2 py-2 text-left transition-colors hover:bg-white/5"
-            >
-              <span className="w-6 shrink-0 text-center text-sm text-[#94A3B8] group-hover:hidden">
-                {index + 1}
-              </span>
-              <span className="hidden w-6 shrink-0 items-center justify-center text-[#F8FAFC] group-hover:flex">
-                <Play
-                  className="size-4 translate-x-px"
-                  strokeWidth={ICON_STROKE}
-                  fill="currentColor"
-                />
-              </span>
+            <div className="group flex w-full items-center gap-3 rounded-md px-2 py-2 transition-colors hover:bg-white/5">
+              <button
+                type="button"
+                onClick={() => void onPlay(toPlayerTrack(track))}
+                className="flex shrink-0 items-center gap-3 text-left"
+                aria-label={`Reproduzir ${track.name}`}
+              >
+                <span className="w-6 text-center text-sm text-[#94A3B8] group-hover:hidden">
+                  {index + 1}
+                </span>
+                <span className="hidden w-6 items-center justify-center text-[#F8FAFC] group-hover:flex">
+                  <Play
+                    className="size-4 translate-x-px"
+                    strokeWidth={ICON_STROKE}
+                    fill="currentColor"
+                  />
+                </span>
 
-              {track.albumCoverUrl ? (
-                <img
-                  src={track.albumCoverUrl}
-                  alt={track.name}
-                  className="size-10 shrink-0 rounded object-cover"
-                />
-              ) : (
-                <div className="size-10 shrink-0 rounded bg-[#111827]" />
-              )}
+                {track.albumCoverUrl ? (
+                  <img
+                    src={track.albumCoverUrl}
+                    alt={track.name}
+                    className="size-10 rounded object-cover"
+                  />
+                ) : (
+                  <div className="size-10 rounded bg-[#111827]" />
+                )}
+              </button>
 
               <div className="min-w-0 flex-1">
-                <p className="truncate text-sm font-medium text-[#F8FAFC]">
+                <button
+                  type="button"
+                  onClick={() => void onPlay(toPlayerTrack(track))}
+                  className="block w-full truncate text-left text-sm font-medium text-[#F8FAFC]"
+                >
                   {track.name}
-                </p>
-                <p className="truncate text-xs text-[#94A3B8]">
-                  {track.artistName}
+                </button>
+                <p className="truncate">
+                  {(track.artists.length > 0
+                    ? track.artists
+                    : [{ id: '', name: track.artistName }]
+                  ).map((artist, artistIndex) => (
+                    <span key={`${artist.id}-${artist.name}-${artistIndex}`}>
+                      {artistIndex > 0 && (
+                        <span className="text-sm text-gray-400">, </span>
+                      )}
+                      {artist.id ? (
+                        <Link
+                          to={`/artist/${artist.id}`}
+                          state={{ artistName: artist.name }}
+                          className={ARTIST_LINK_CLASS}
+                        >
+                          {artist.name}
+                        </Link>
+                      ) : (
+                        <span className="text-sm text-gray-400">
+                          {artist.name}
+                        </span>
+                      )}
+                    </span>
+                  ))}
                 </p>
               </div>
-            </button>
+            </div>
           </li>
         ))}
       </ul>
@@ -215,9 +261,11 @@ function ArtistsSection({ artists }: { artists: SpotifyArtist[] }) {
       <h3 className="mb-3 text-xl font-bold text-[#F8FAFC]">Artistas</h3>
       <div className="-mx-1 flex gap-4 overflow-x-auto px-1 pb-2">
         {artists.map((artist) => (
-          <article
+          <Link
             key={artist.id}
-            className="w-36 shrink-0 rounded-lg bg-white/5 p-4 text-center transition-colors hover:bg-white/10 sm:w-40"
+            to={`/artist/${artist.id}`}
+            state={{ artistName: artist.name }}
+            className="w-36 shrink-0 rounded-lg bg-white/5 p-4 text-center transition-colors hover:bg-white/10 focus:outline-none focus-visible:ring-2 focus-visible:ring-[#00E5FF] sm:w-40"
           >
             {artist.imageUrl ? (
               <img
@@ -234,7 +282,7 @@ function ArtistsSection({ artists }: { artists: SpotifyArtist[] }) {
               {artist.name}
             </h4>
             <p className="mt-1 text-xs text-[#94A3B8]">Artista</p>
-          </article>
+          </Link>
         ))}
       </div>
     </section>

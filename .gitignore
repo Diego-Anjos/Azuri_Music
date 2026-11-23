@@ -1,20 +1,27 @@
-# Environment / secrets
+# Environment / secrets (Spotify keys, etc.)
 .env
 .env.local
-.env.*.local
+.env.development
 .env.production
+.env.*.local
+.env.*
+!.env.example
 *.local
 
 # Dependencies
 node_modules/
 
-# Build / distribution
+# Build / distribution / caches
 dist/
+dist-ssr/
+server/dist/
 build/
 .output/
-dist-ssr/
+.vite/
+.turbo
+.next
 
-# Logs and caches
+# Logs
 logs/
 *.log
 npm-debug.log*
@@ -22,13 +29,12 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
-.turbo
-.next
 
-# IDE / OS
+# IDE / OS / editor
 .DS_Store
 Thumbs.db
 .vscode/
+.cursor/
 .idea
 *.suo
 *.ntvs*

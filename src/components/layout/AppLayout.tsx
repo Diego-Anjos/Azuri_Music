@@ -7,7 +7,9 @@ export function AppLayout() {
     <div className="relative flex h-screen flex-col overflow-hidden bg-[#0B0F19]">
       <div className="flex min-h-0 flex-1 pb-24">
         <Sidebar />
-        <Outlet />
+        <main className="flex h-full min-h-0 min-w-0 flex-1 flex-col overflow-y-auto">
+          <Outlet />
+        </main>
       </div>
       <div className="pointer-events-none absolute inset-x-0 bottom-0 z-30">
         <div className="pointer-events-auto">
