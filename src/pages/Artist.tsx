@@ -1,22 +1,65 @@
-import { Camera, MapPin, Play, X } from 'lucide-react'
-import { useEffect, useMemo, useState } from 'react'
+import { ChevronDown, ChevronUp, Loader2, MapPin, Play } from 'lucide-react'
+import { useEffect, useState } from 'react'
 import { useLocation, useNavigate, useParams } from 'react-router-dom'
 import { TrackRow } from '../components/TrackRow'
 import {
   getArtistProfile,
+  searchArtistTracksPage,
   type ArtistProfile,
   type ArtistProfileTrack,
 } from '../services/spotify'
 import { usePlayerStore } from '../store/usePlayerStore'
 
 const ICON_STROKE = 1.5
+const INITIAL_VISIBLE = 5
+const PAGE_SIZE = 10
 
 type ArtistLocationState = {
   artistName?: string
 }
 
-function bannerStorageKey(artistId: string) {
-  return `azuri_banner_${artistId}`
+function mergeUniqueTracks(
+  current: ArtistProfileTrack[],
+  incoming: ArtistProfileTrack[],
+): ArtistProfileTrack[] {
+  const seen = new Set(current.map((t) => t.id))
+  const merged = [...current]
+  for (const track of incoming) {
+    if (!seen.has(track.id)) {
+      seen.add(track.id)
+      merged.push(track)
+    }
+  }
+  return merged
+}
+
+function isValidHttpsUrl(url: string | null | undefined): url is string {
+  return Boolean(url && /^https:\/\//i.test(url.trim()))
+}
+
+function getAlbumFallback(artist: ArtistProfile): string | null {
+  // ArtistProfileAlbum usa imageUrl (não images[])
+  const albumCover = artist.albums?.[0]?.imageUrl
+  return isValidHttpsUrl(albumCover) ? albumCover : null
+}
+
+function getAvatarFallback(artist: ArtistProfile): string | null {
+  const avatar = artist.images?.[0]?.url
+  return isValidHttpsUrl(avatar) ? avatar : null
+}
+
+function resolveInitialBanner(artist: ArtistProfile): {
+  src: string | null
+  isOfficial: boolean
+} {
+  if (isValidHttpsUrl(artist.bannerUrl)) {
+    return { src: artist.bannerUrl.trim(), isOfficial: true }
+  }
+  const album = getAlbumFallback(artist)
+  if (album) return { src: album, isOfficial: false }
+  const avatar = getAvatarFallback(artist)
+  if (avatar) return { src: avatar, isOfficial: false }
+  return { src: null, isOfficial: false }
 }
 
 export function Artist() {
@@ -30,27 +73,39 @@ export function Artist() {
   const [artist, setArtist] = useState<ArtistProfile | null>(null)
   const [loading, setLoading] = useState(true)
   const [isFollowing, setIsFollowing] = useState(false)
-  const [showAllTracks, setShowAllTracks] = useState(false)
+  const [loadedTracks, setLoadedTracks] = useState<ArtistProfileTrack[]>([])
+  const [visibleCount, setVisibleCount] = useState(INITIAL_VISIBLE)
+  const [tracksOffset, setTracksOffset] = useState(0)
+  const [hasMoreTracks, setHasMoreTracks] = useState(true)
+  const [isLoadingMore, setIsLoadingMore] = useState(false)
   const [isBioExpanded, setIsBioExpanded] = useState(false)
-  const [customBannerUrl, setCustomBannerUrl] = useState<string | null>(null)
-  const [isBannerModalOpen, setIsBannerModalOpen] = useState(false)
-  const [bannerInput, setBannerInput] = useState('')
+  const [bannerSrc, setBannerSrc] = useState<string | null>(null)
+  const [isOfficialBanner, setIsOfficialBanner] = useState(false)
 
   useEffect(() => {
     async function loadData() {
       if (!id) return
       setLoading(true)
       setIsBioExpanded(false)
+      setBannerSrc(null)
+      setIsOfficialBanner(false)
+      setLoadedTracks([])
+      setVisibleCount(INITIAL_VISIBLE)
+      setTracksOffset(0)
+      setHasMoreTracks(true)
+
       const data = await getArtistProfile(id, artistName || undefined)
       setArtist(data)
 
-      if (data?.id) {
-        const saved = localStorage.getItem(bannerStorageKey(data.id))
-        setCustomBannerUrl(saved)
-        setBannerInput(saved ?? '')
-      } else {
-        setCustomBannerUrl(null)
-        setBannerInput('')
+      if (data) {
+        const initial = data.topTracks ?? []
+        setLoadedTracks(initial)
+        setVisibleCount(Math.min(INITIAL_VISIBLE, initial.length))
+        setTracksOffset(initial.length)
+        setHasMoreTracks(initial.length > 0)
+        const resolved = resolveInitialBanner(data)
+        setBannerSrc(resolved.src)
+        setIsOfficialBanner(resolved.isOfficial)
       }
 
       setLoading(false)
@@ -60,43 +115,73 @@ export function Artist() {
   }, [id, artistName])
 
   const avatarUrl = artist?.images?.[0]?.url
-  const fallbackBannerUrl =
-    artist?.albums?.[0]?.imageUrl || artist?.images?.[0]?.url || null
+  const visibleTracks = loadedTracks.slice(0, visibleCount)
+  const isExpanded = visibleCount > INITIAL_VISIBLE
 
-  const bannerUrl = useMemo(() => {
-    return customBannerUrl || artist?.bannerUrl || fallbackBannerUrl
-  }, [customBannerUrl, artist?.bannerUrl, fallbackBannerUrl])
+  async function handleLoadMoreTracks() {
+    if (!artist || isLoadingMore) return
+
+    // Já há faixas carregadas além do compacto — só expandir
+    if (visibleCount < loadedTracks.length) {
+      setVisibleCount(loadedTracks.length)
+      return
+    }
+
+    if (!hasMoreTracks) return
+
+    setIsLoadingMore(true)
+    try {
+      const page = await searchArtistTracksPage(
+        artist.name,
+        artist.id,
+        tracksOffset,
+        PAGE_SIZE,
+      )
+      const merged = mergeUniqueTracks(loadedTracks, page.tracks)
+      setLoadedTracks(merged)
+      setTracksOffset(page.nextOffset)
+      // Sem resultados filtrados nesta página → não insistir; senão confiar no hasMore da API
+      setHasMoreTracks(page.tracks.length > 0 ? page.hasMore : false)
+      setVisibleCount(merged.length)
+    } finally {
+      setIsLoadingMore(false)
+    }
+  }
+
+  function handleShowLessTracks() {
+    setVisibleCount(Math.min(INITIAL_VISIBLE, loadedTracks.length))
+  }
 
   function handlePlayTrack(track: ArtistProfileTrack) {
     if (!artist) return
-    void playTrack(track, artist.topTracks)
+    void playTrack(track, loadedTracks.length > 0 ? loadedTracks : artist.topTracks)
   }
 
   function handlePlayAll() {
-    const first = artist?.topTracks[0]
+    const queue = loadedTracks.length > 0 ? loadedTracks : artist?.topTracks ?? []
+    const first = queue[0]
     if (!first || !artist) return
-    void playTrack(first, artist.topTracks)
+    void playTrack(first, queue)
   }
 
-  function handleSaveBanner() {
-    if (!artist) return
-    const trimmed = bannerInput.trim()
-    if (!trimmed) {
-      localStorage.removeItem(bannerStorageKey(artist.id))
-      setCustomBannerUrl(null)
-    } else {
-      localStorage.setItem(bannerStorageKey(artist.id), trimmed)
-      setCustomBannerUrl(trimmed)
+  function handleBannerError() {
+    if (!artist) {
+      setBannerSrc(null)
+      setIsOfficialBanner(false)
+      return
     }
-    setIsBannerModalOpen(false)
-  }
 
-  function handleClearBanner() {
-    if (!artist) return
-    localStorage.removeItem(bannerStorageKey(artist.id))
-    setCustomBannerUrl(null)
-    setBannerInput('')
-    setIsBannerModalOpen(false)
+    const fallback =
+      getAlbumFallback(artist) || getAvatarFallback(artist) || null
+
+    if (fallback && fallback !== bannerSrc) {
+      setBannerSrc(fallback)
+      setIsOfficialBanner(false)
+      return
+    }
+
+    setBannerSrc(null)
+    setIsOfficialBanner(false)
   }
 
   if (loading) {
@@ -118,12 +203,17 @@ export function Artist() {
   return (
     <div className="min-h-0 flex-1 overflow-y-auto bg-[#0B0F19] pb-32">
       {/* 1. BANNER PANORÂMICO (SoundCloud + Spotify + Azuri) */}
-      <div className="group relative h-72 w-full overflow-hidden bg-[#0B0F19] md:h-80">
-        {bannerUrl ? (
+      <div className="relative h-72 w-full overflow-hidden bg-[#0B0F19] pt-2 md:h-80 md:pt-4">
+        {bannerSrc ? (
           <img
-            src={bannerUrl}
+            src={bannerSrc}
             alt=""
-            className="absolute inset-0 h-full w-full object-cover object-center"
+            onError={handleBannerError}
+            className={`absolute inset-0 h-full w-full object-cover object-center ${
+              isOfficialBanner
+                ? 'scale-100 opacity-80 blur-none'
+                : 'scale-110 opacity-60 blur-md'
+            }`}
           />
         ) : (
           <div className="absolute inset-0 bg-gradient-to-br from-[#111827] to-[#0B0F19]" />
@@ -131,19 +221,6 @@ export function Artist() {
 
         {/* Gradiente suave — capa nítida, texto legível */}
         <div className="absolute inset-0 bg-gradient-to-t from-[#0B0F19] via-[#0B0F19]/40 to-black/30" />
-
-        {/* Editar capa */}
-        <button
-          type="button"
-          onClick={() => {
-            setBannerInput(customBannerUrl ?? '')
-            setIsBannerModalOpen(true)
-          }}
-          className="absolute top-4 right-6 z-20 flex items-center gap-2 rounded-full border border-white/10 bg-black/50 px-3 py-1.5 text-xs text-gray-200 opacity-0 backdrop-blur-md transition-opacity group-hover:opacity-100 hover:bg-black/80"
-        >
-          <Camera className="h-3.5 w-3.5" strokeWidth={ICON_STROKE} />
-          Editar Capa
-        </button>
 
         {/* Conteúdo do Header */}
         <div className="absolute bottom-0 z-10 flex w-full flex-col items-center gap-5 p-6 text-center md:flex-row md:items-end md:gap-6 md:p-10 md:text-left">
@@ -200,87 +277,83 @@ export function Artist() {
         </div>
       </div>
 
-      {/* Modal Editar Capa */}
-      {isBannerModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm">
-          <div className="w-full max-w-md rounded-2xl border border-white/10 bg-[#111827] p-6 shadow-2xl">
-            <div className="mb-4 flex items-center justify-between">
-              <h2 className="text-lg font-bold text-white">Editar Capa</h2>
-              <button
-                type="button"
-                onClick={() => setIsBannerModalOpen(false)}
-                className="rounded-full p-1.5 text-gray-400 transition-colors hover:bg-white/10 hover:text-white"
-                aria-label="Fechar"
-              >
-                <X className="h-4 w-4" strokeWidth={ICON_STROKE} />
-              </button>
-            </div>
-            <p className="mb-3 text-sm text-gray-400">
-              Cole o URL de uma imagem panorâmica para usar como capa deste
-              artista neste dispositivo.
-            </p>
-            <input
-              type="url"
-              value={bannerInput}
-              onChange={(e) => setBannerInput(e.target.value)}
-              placeholder="https://..."
-              className="mb-4 w-full rounded-lg border border-white/10 bg-[#0B0F19] px-3 py-2.5 text-sm text-white outline-none placeholder:text-gray-600 focus:border-cyan-400/50"
-            />
-            <div className="flex flex-wrap gap-2">
-              <button
-                type="button"
-                onClick={handleSaveBanner}
-                className="rounded-full bg-cyan-400 px-4 py-2 text-sm font-bold text-black transition-transform hover:scale-105"
-              >
-                Guardar Capa
-              </button>
-              <button
-                type="button"
-                onClick={handleClearBanner}
-                className="rounded-full border border-white/15 px-4 py-2 text-sm font-medium text-gray-300 transition-colors hover:border-white/30 hover:text-white"
-              >
-                Remover personalizada
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
       {/* 2. GRID PRINCIPAL DE CONTEÚDO */}
       <div className="mx-auto max-w-[1600px] p-6 md:p-10">
         <div className="grid grid-cols-1 gap-8 md:gap-12 lg:grid-cols-3">
           <div className="lg:col-span-2">
             {/* 1. FAIXAS EM DESTAQUE */}
-            <h2 className="mb-6 text-2xl font-bold text-white">
-              Faixas em Destaque
-            </h2>
+            <div className="mb-6 flex flex-wrap items-end justify-between gap-3">
+              <h2 className="text-2xl font-bold text-white">
+                Faixas em Destaque
+              </h2>
+              {loadedTracks.length > 0 && (
+                <p className="text-sm text-gray-400">
+                  Mostrando {visibleTracks.length}{' '}
+                  {visibleTracks.length === 1 ? 'música' : 'músicas'}
+                  {loadedTracks.length > visibleTracks.length
+                    ? ` · ${loadedTracks.length} carregadas`
+                    : null}
+                </p>
+              )}
+            </div>
 
-            {artist.topTracks?.length > 0 ? (
+            {loadedTracks.length > 0 ? (
               <>
                 <div className="flex flex-col gap-2">
-                  {artist.topTracks
-                    .slice(0, showAllTracks ? artist.topTracks.length : 5)
-                    .map((track, index) => (
-                      <TrackRow
-                        key={`${track.id}-${index}`}
-                        track={track}
-                        index={index}
-                        variant="featured"
-                        artistsFallback={artist.name}
-                        onPlay={() => handlePlayTrack(track)}
-                      />
-                    ))}
+                  {visibleTracks.map((track, index) => (
+                    <TrackRow
+                      key={`${track.id}-${index}`}
+                      track={track}
+                      index={index}
+                      variant="featured"
+                      artistsFallback={artist.name}
+                      onPlay={() => handlePlayTrack(track)}
+                    />
+                  ))}
                 </div>
 
-                {artist.topTracks.length > 5 && (
-                  <button
-                    type="button"
-                    onClick={() => setShowAllTracks((prev) => !prev)}
-                    className="mt-6 text-sm font-bold uppercase tracking-wider text-gray-400 transition-colors hover:text-white"
-                  >
-                    {showAllTracks ? 'Mostrar Menos' : 'Ver Mais'}
-                  </button>
-                )}
+                <div className="mt-4 flex flex-col items-center gap-2">
+                  {(hasMoreTracks || visibleCount < loadedTracks.length) && (
+                    <button
+                      type="button"
+                      onClick={() => void handleLoadMoreTracks()}
+                      disabled={isLoadingMore}
+                      className="mx-auto mt-4 flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-5 py-2.5 text-sm text-gray-200 transition-all hover:border-cyan-400/50 hover:bg-cyan-500/10 hover:text-cyan-400 disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      {isLoadingMore ? (
+                        <>
+                          <Loader2
+                            className="h-4 w-4 animate-spin"
+                            strokeWidth={ICON_STROKE}
+                          />
+                          A carregar…
+                        </>
+                      ) : (
+                        <>
+                          <ChevronDown
+                            className="h-4 w-4"
+                            strokeWidth={ICON_STROKE}
+                          />
+                          Carregar mais músicas
+                        </>
+                      )}
+                    </button>
+                  )}
+
+                  {isExpanded && (
+                    <button
+                      type="button"
+                      onClick={handleShowLessTracks}
+                      className="mt-1 flex items-center gap-1.5 text-xs text-gray-500 transition-colors hover:text-gray-300"
+                    >
+                      <ChevronUp
+                        className="h-3.5 w-3.5"
+                        strokeWidth={ICON_STROKE}
+                      />
+                      Mostrar menos
+                    </button>
+                  )}
+                </div>
               </>
             ) : (
               <p className="text-gray-400">

@@ -276,6 +276,92 @@ export async function searchTracksByQuery(
   }
 }
 
+export interface ArtistTracksPageResult {
+  tracks: ArtistProfileTrack[]
+  nextOffset: number
+  hasMore: boolean
+}
+
+/**
+ * Página de faixas do artista via /v1/search (limit máx. 50, offset ≥ 0).
+ * Filtra apenas faixas cujo artista corresponde a artistId/artistName.
+ */
+export async function searchArtistTracksPage(
+  artistName: string,
+  artistId: string,
+  offset: number = 0,
+  limit: number = 10,
+): Promise<ArtistTracksPageResult> {
+  const safeLimit = Math.min(50, Math.max(1, limit))
+  const safeOffset = Math.max(0, Math.floor(offset))
+  const query = artistName.trim()
+
+  if (!query) {
+    return { tracks: [], nextOffset: safeOffset, hasMore: false }
+  }
+
+  try {
+    const token = await getAccessToken()
+    const url = `https://api.spotify.com/v1/search?q=${encodeURIComponent(query)}&type=track&limit=${safeLimit}&offset=${safeOffset}`
+
+    const response = await fetch(url, {
+      headers: {
+        Authorization: 'Bearer ' + token,
+      },
+    })
+
+    if (!response.ok) {
+      const errorBody = await response.text()
+      console.error(errorBody)
+      throw new Error(`Falha ao paginar faixas do artista (${response.status})`)
+    }
+
+    const data = (await response.json()) as SpotifyCatalogApiResponse
+    const rawItems = (data.tracks?.items ?? []).filter(
+      (item): item is NonNullable<typeof item> =>
+        item != null && Boolean(item.id) && Boolean(item.name),
+    )
+
+    const exactArtistId = artistId?.trim()
+    const artistNameLower = query.toLowerCase()
+
+    const tracks: ArtistProfileTrack[] = rawItems
+      .filter((item) =>
+        (item.artists ?? []).some((a) => {
+          if (a.id && exactArtistId) return a.id === exactArtistId
+          return a.name?.toLowerCase().includes(artistNameLower)
+        }),
+      )
+      .map((item) => ({
+        id: item.id,
+        name: item.name,
+        artists: (item.artists ?? [])
+          .filter((artist) => Boolean(artist.name))
+          .map((artist, index) => ({
+            id: artist.id || `artist-${item.id}-${index}`,
+            name: artist.name,
+          })),
+        album: item.album
+          ? {
+              name: item.album.name,
+              release_date: item.album.release_date,
+              images: item.album.images,
+            }
+          : null,
+        duration_ms: item.duration_ms,
+      }))
+
+    const nextOffset = safeOffset + safeLimit
+    // Spotify search: há mais resultados se a página veio cheia
+    const hasMore = rawItems.length >= safeLimit
+
+    return { tracks, nextOffset, hasMore }
+  } catch (error) {
+    console.error('Erro ao paginar catálogo do artista:', error)
+    return { tracks: [], nextOffset: safeOffset, hasMore: false }
+  }
+}
+
 export async function searchCatalog(
   query: string,
 ): Promise<SpotifyCatalogSearchResult> {

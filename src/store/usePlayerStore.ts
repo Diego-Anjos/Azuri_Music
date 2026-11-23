@@ -26,6 +26,7 @@ interface PlayerState {
   /** Fração 0–1 pedida ao ReactPlayer; consumida e limpa pelo MusicPlayer. */
   seekRequest: number | null
   queue: PlayerTrack[]
+  isLyricsOpen: boolean
   playTrack: (track: PlayerTrack, newQueue?: PlayerTrack[]) => Promise<void>
   addToQueue: (track: PlayerTrack) => void
   playNext: (track: PlayerTrack) => Promise<void>
@@ -37,6 +38,8 @@ interface PlayerState {
   seekTo: (fraction: number) => void
   clearSeekRequest: () => void
   handleNextTrack: () => Promise<void>
+  toggleLyrics: () => void
+  closeLyrics: () => void
 }
 
 function toPlayerTrackFromSearch(track: {
@@ -101,6 +104,7 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
   duration: 0,
   seekRequest: null,
   queue: [],
+  isLyricsOpen: false,
   playTrack: async (track, newQueue) => {
     const nextState: Partial<PlayerState> = {
       currentTrack: track,
@@ -176,6 +180,8 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
     set({ progress: clamped, seekRequest: clamped })
   },
   clearSeekRequest: () => set({ seekRequest: null }),
+  toggleLyrics: () => set((state) => ({ isLyricsOpen: !state.isLyricsOpen })),
+  closeLyrics: () => set({ isLyricsOpen: false }),
   handleNextTrack: async () => {
     const { queue, currentTrack } = get()
 

@@ -1,6 +1,7 @@
 import {
   ChevronUp,
   Heart,
+  Mic2,
   Pause,
   Play,
   Repeat,
@@ -45,6 +46,8 @@ export function MusicPlayer() {
     setDuration,
     clearSeekRequest,
     handleNextTrack,
+    isLyricsOpen,
+    toggleLyrics,
   } = usePlayerStore()
   const playerRef = useRef<ReactPlayer | null>(null)
   const [liked, setLiked] = useState(false)
@@ -354,24 +357,48 @@ export function MusicPlayer() {
         )}
       </div>
 
-      {/* Direita — volume */}
-      <div className="hidden flex-1 items-center justify-end gap-2 sm:flex">
-        <Volume2
-          className="size-4 shrink-0 text-[#94A3B8]"
-          strokeWidth={ICON_STROKE}
-        />
-        <input
-          type="range"
-          min={0}
-          max={100}
-          value={volumePercent}
-          onChange={(e) => setVolume(Number(e.target.value) / 100)}
-          aria-label="Volume"
-          style={{
-            background: `linear-gradient(to right, #22d3ee 0%, #22d3ee ${volumePercent}%, rgba(255,255,255,0.15) ${volumePercent}%, rgba(255,255,255,0.15) 100%)`,
-          }}
-          className="h-1.5 w-28 cursor-pointer appearance-none rounded-full outline-none [&::-moz-range-thumb]:size-3 [&::-moz-range-thumb]:appearance-none [&::-moz-range-thumb]:rounded-full [&::-moz-range-thumb]:border-0 [&::-moz-range-thumb]:bg-cyan-400 [&::-webkit-slider-thumb]:size-3 [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-cyan-400 [&::-webkit-slider-thumb]:shadow-[0_0_8px_rgba(34,211,238,0.6)]"
-        />
+      {/* Direita — letras + volume */}
+      <div className="flex flex-1 items-center justify-end gap-3">
+        <button
+          type="button"
+          title="Letras"
+          aria-label="Letras"
+          aria-pressed={isLyricsOpen}
+          onClick={toggleLyrics}
+          disabled={!currentTrack}
+          className={`relative flex flex-col items-center gap-1 transition-colors duration-200 disabled:cursor-not-allowed disabled:opacity-40 ${
+            isLyricsOpen
+              ? 'text-cyan-400'
+              : 'text-[#94A3B8] hover:text-[#F8FAFC]'
+          }`}
+        >
+          <Mic2 className="size-5" strokeWidth={ICON_STROKE} />
+          {isLyricsOpen && (
+            <span
+              className="absolute -bottom-1 h-1 w-1 rounded-full bg-cyan-400 shadow-[0_0_6px_rgba(34,211,238,0.9)]"
+              aria-hidden
+            />
+          )}
+        </button>
+
+        <div className="hidden items-center gap-2 sm:flex">
+          <Volume2
+            className="size-4 shrink-0 text-[#94A3B8]"
+            strokeWidth={ICON_STROKE}
+          />
+          <input
+            type="range"
+            min={0}
+            max={100}
+            value={volumePercent}
+            onChange={(e) => setVolume(Number(e.target.value) / 100)}
+            aria-label="Volume"
+            style={{
+              background: `linear-gradient(to right, #22d3ee 0%, #22d3ee ${volumePercent}%, rgba(255,255,255,0.15) ${volumePercent}%, rgba(255,255,255,0.15) 100%)`,
+            }}
+            className="h-1.5 w-28 cursor-pointer appearance-none rounded-full outline-none [&::-moz-range-thumb]:size-3 [&::-moz-range-thumb]:appearance-none [&::-moz-range-thumb]:rounded-full [&::-moz-range-thumb]:border-0 [&::-moz-range-thumb]:bg-cyan-400 [&::-webkit-slider-thumb]:size-3 [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-cyan-400 [&::-webkit-slider-thumb]:shadow-[0_0_8px_rgba(34,211,238,0.6)]"
+          />
+        </div>
       </div>
     </footer>
   )

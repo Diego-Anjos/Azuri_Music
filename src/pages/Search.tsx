@@ -80,7 +80,7 @@ export function Search() {
 
   return (
     <main className="flex min-h-0 flex-1 flex-col overflow-y-auto bg-gradient-to-b from-[#1E293B] to-[#0B0F19]">
-      <header className="px-4 pb-2 pt-6 md:px-8">
+      <header className="px-4 pb-2 pt-2 md:px-8 md:pt-4">
         <h2 className="mb-4 text-3xl font-bold text-[#F8FAFC]">Pesquisar</h2>
         <label className="relative block max-w-xl">
           <span className="sr-only">Buscar músicas, artistas e playlists</span>

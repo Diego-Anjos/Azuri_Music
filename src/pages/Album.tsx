@@ -121,7 +121,7 @@ export function Album() {
         )}
         <div className="absolute inset-0 bg-gradient-to-t from-[#0B0F19] via-[#0B0F19]/85 to-transparent" />
 
-        <div className="relative z-10 mx-auto flex max-w-[1600px] flex-col items-center gap-5 px-6 py-8 text-center md:flex-row md:items-end md:gap-8 md:px-10 md:py-10 md:text-left">
+        <div className="relative z-10 mx-auto flex max-w-[1600px] flex-col items-center gap-5 px-6 pb-8 pt-4 text-center md:flex-row md:items-end md:gap-8 md:px-10 md:pb-10 md:pt-4 md:text-left">
           {coverUrl ? (
             <img
               src={coverUrl}
