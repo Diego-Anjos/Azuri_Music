@@ -7,9 +7,13 @@ import {
 import { pushRecentPlay } from '../services/libraryStorage'
 import { recordTrackPlay } from '../services/recommendationService'
 import { searchTracksByQuery } from '../services/spotify'
-
-const RESOLVE_URL = 'http://localhost:3001/api/stream/resolve'
-const STREAM_BASE = 'http://localhost:3001/api/stream'
+import { resolveYoutubeVideoId } from '../services/youtubeResolveService'
+import {
+  beginPlayRequest,
+  getStreamAbortSignal,
+  isPlayRequestCurrent,
+  resetNativeAudioElement,
+} from '../services/playbackGuard'
 
 export interface PlayerTrack {
   id: string
@@ -40,6 +44,8 @@ interface PlayerState {
   seekRequest: number | null
   queue: PlayerTrack[]
   isLyricsOpen: boolean
+  /** Monotonic id da última playTrack — UI / fallback checam stale loads. */
+  playRequestId: number
   playTrack: (track: PlayerTrack, newQueue?: PlayerTrack[]) => Promise<void>
   addToQueue: (track: PlayerTrack) => void
   playNext: (track: PlayerTrack) => Promise<void>
@@ -82,53 +88,29 @@ function toPlayerTrackFromSearch(track: {
   }
 }
 
-function buildTrackQuery(track: PlayerTrack): string {
+function trackStreamParams(track: PlayerTrack) {
   const artistName = track.artists?.[0]?.name ?? ''
-  return `${track.name} ${artistName}`.trim()
-}
+  const title = track.name ?? ''
+  const query = `${title} ${artistName}`.trim()
+  const durationSec =
+    track.duration_ms && track.duration_ms > 0
+      ? track.duration_ms / 1000
+      : undefined
 
-async function resolveYoutubeVideoId(track: PlayerTrack): Promise<string | null> {
-  const query = buildTrackQuery(track)
-  const quality = getAudioSettings().quality
-
-  try {
-    const response = await fetch(
-      `${RESOLVE_URL}?query=${encodeURIComponent(query)}&quality=${encodeURIComponent(quality)}`,
-      { headers: { Accept: 'application/json' } },
-    )
-
-    if (!response.ok) {
-      // Compat: tenta rota legada com resolve=1
-      const legacy = await fetch(
-        `${STREAM_BASE}?query=${encodeURIComponent(query)}&quality=${encodeURIComponent(quality)}&resolve=1`,
-        { headers: { Accept: 'application/json' } },
-      )
-      if (!legacy.ok) {
-        console.error('Falha ao resolver vídeo:', response.status)
-        return null
-      }
-      const legacyData = (await legacy.json()) as { videoId?: string }
-      return legacyData.videoId ?? null
-    }
-
-    const data = (await response.json()) as {
-      videoId?: string
-      title?: string
-    }
-
-    if (!data.videoId) {
-      console.error('Resposta sem videoId')
-      return null
-    }
-
-    return data.videoId
-  } catch (error) {
-    console.error('Erro ao resolver vídeo no YouTube:', error)
-    return null
+  return {
+    query,
+    title: title || undefined,
+    artist: artistName || undefined,
+    duration: durationSec,
   }
 }
 
-async function startPlayback(track: PlayerTrack): Promise<void> {
+async function startPlayback(
+  track: PlayerTrack,
+  requestId: number,
+): Promise<void> {
+  if (!isPlayRequestCurrent(requestId)) return
+
   // Uploads locais / data URLs / blob — Web Audio direto
   if (track.audioUrl) {
     const url = track.audioUrl
@@ -137,9 +119,11 @@ async function startPlayback(track: PlayerTrack): Promise<void> {
       !url.startsWith('http://localhost:3001/') &&
       !url.startsWith(window.location.origin)
 
+    if (!isPlayRequestCurrent(requestId)) return
+
     usePlayerStore.setState({
       localAudioUrl: needsProxy
-        ? buildStreamProxyUrl(buildTrackQuery(track))
+        ? buildStreamProxyUrl(trackStreamParams(track))
         : url,
       youtubeVideoId: null,
       isEqActive: false,
@@ -150,7 +134,9 @@ async function startPlayback(track: PlayerTrack): Promise<void> {
   }
 
   // Streams externos via proxy CORS → permite EQ / Web Audio
-  const proxyUrl = buildStreamProxyUrl(buildTrackQuery(track))
+  const proxyUrl = buildStreamProxyUrl(trackStreamParams(track))
+  if (!isPlayRequestCurrent(requestId)) return
+
   usePlayerStore.setState({
     localAudioUrl: proxyUrl,
     youtubeVideoId: null,
@@ -171,11 +157,12 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
   seekRequest: null,
   queue: [],
   isLyricsOpen: false,
+  playRequestId: 0,
   setEqActive: (active) => set({ isEqActive: active }),
   refreshStreamQuality: () => {
     const { localAudioUrl, currentTrack } = get()
     if (!currentTrack || !isStreamProxyUrl(localAudioUrl)) return
-    const nextUrl = buildStreamProxyUrl(buildTrackQuery(currentTrack))
+    const nextUrl = buildStreamProxyUrl(trackStreamParams(currentTrack))
     if (nextUrl === localAudioUrl) return
     set({
       localAudioUrl: nextUrl,
@@ -184,10 +171,20 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
     })
   },
   fallbackToYoutube: async () => {
-    const { currentTrack } = get()
+    const { currentTrack, playRequestId } = get()
     if (!currentTrack || currentTrack.audioUrl) return
 
-    const videoId = await resolveYoutubeVideoId(currentTrack)
+    const requestId = playRequestId
+    const trackSnapshot = currentTrack
+    const videoId = await resolveYoutubeVideoId(
+      trackSnapshot,
+      getStreamAbortSignal(),
+    )
+
+    // Impede que um fallback antigo atropelo a faixa atual
+    if (!isPlayRequestCurrent(requestId)) return
+    if (get().currentTrack?.id !== trackSnapshot.id) return
+
     if (!videoId) {
       set({ isPlaying: false, isEqActive: false })
       return
@@ -201,6 +198,9 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
     })
   },
   playTrack: async (track, newQueue) => {
+    const { requestId } = beginPlayRequest()
+    resetNativeAudioElement()
+
     const nextState: Partial<PlayerState> = {
       currentTrack: track,
       youtubeVideoId: null,
@@ -210,6 +210,7 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
       progress: 0,
       duration: 0,
       seekRequest: null,
+      playRequestId: requestId,
     }
 
     if (newQueue) {
@@ -239,7 +240,8 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
       // ignore recommendation history failures
     }
 
-    await startPlayback(track)
+    if (!isPlayRequestCurrent(requestId)) return
+    await startPlayback(track, requestId)
   },
   addToQueue: (track) => {
     const { queue, currentTrack } = get()
@@ -332,6 +334,9 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
       return
     }
 
+    const { requestId } = beginPlayRequest()
+    resetNativeAudioElement()
+
     set({
       currentTrack: nextTrack,
       youtubeVideoId: null,
@@ -340,6 +345,7 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
       isPlaying: false,
       progress: 0,
       duration: 0,
+      playRequestId: requestId,
       queue: queue.slice(currentIndex + 1),
     })
 
@@ -358,6 +364,7 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
       // ignore storage failures
     }
 
-    await startPlayback(nextTrack)
+    if (!isPlayRequestCurrent(requestId)) return
+    await startPlayback(nextTrack, requestId)
   },
 }))

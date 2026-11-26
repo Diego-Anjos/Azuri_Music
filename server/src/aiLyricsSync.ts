@@ -31,7 +31,8 @@ type AiSyncCacheStore = Record<
 const memoryCache = new Map<string, AiSyncedLine[]>()
 
 function cacheKey(artist: string, title: string): string {
-  return `${artist.trim().toLowerCase()}::${title.trim().toLowerCase()}`
+  // v4 — invalida alinhamentos antigos (possível letra errada / tradução)
+  return `v4::${artist.trim().toLowerCase()}::${title.trim().toLowerCase()}`
 }
 
 function loadDiskCache(): AiSyncCacheStore {
@@ -211,41 +212,74 @@ function resolveDirectAudioUrl(videoUrl: string): Promise<string> {
   })
 }
 
+function stripAiSyncQuerySuffixes(query: string): string {
+  return query
+    .replace(
+      /\b(official\s*(audio|video|music\s*video)?|lyrics?|audio|mv|hd|4k|visualizer|topic)\b/gi,
+      ' ',
+    )
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
 /** Mesma cascata interna do /api/stream: play-dl search → yt-dlp → bytes. */
 async function fetchInternalTrackAudio(
   title: string,
   artist: string,
   trackId?: string,
 ): Promise<{ base64: string; mimeType: string; bytes: number } | null> {
-  const query = [artist, title, trackId].filter(Boolean).join(' ').trim()
-  if (!query) return null
+  const baseQuery = [artist, title].filter(Boolean).join(' ').trim()
+  if (!baseQuery) return null
 
-  console.log(`[AI-Sync] Fallback interno de stream para "${query}"`)
+  console.log(`[AI-Sync] Fallback interno de stream para "${baseQuery}"`)
 
-  // 1) Via proxy local /api/stream (reusa o pipeline do server)
-  const proxyUrl = `${localOrigin()}/api/stream?query=${encodeURIComponent(`${artist} ${title}`.trim())}&quality=medium`
-  const viaProxy = await downloadUrlToAudio(proxyUrl)
-  if (viaProxy) return viaProxy
+  const stripped = stripAiSyncQuerySuffixes(baseQuery)
+  const searchVariants = [
+    `${baseQuery} audio`,
+    baseQuery,
+    stripped && stripped.toLowerCase() !== baseQuery.toLowerCase()
+      ? stripped
+      : null,
+    trackId ? `${baseQuery} ${trackId}` : null,
+  ].filter((item): item is string => Boolean(item))
 
-  // 2) Direto: YouTube search + yt-dlp
-  try {
-    const results = await play.search(`${artist} ${title}`.trim(), {
-      limit: 1,
-      source: { youtube: 'video' },
+  // 1) Via proxy local /api/stream (reusa o pipeline do server + fallbacks de busca)
+  for (const variant of searchVariants) {
+    const params = new URLSearchParams({
+      query: variant,
+      quality: 'normal',
     })
-    const first = Array.isArray(results) ? results[0] : undefined
-    if (!first?.id) {
-      console.warn('[AI-Sync] Nenhum resultado YouTube para fallback')
-      return null
-    }
-
-    const videoUrl = `https://www.youtube.com/watch?v=${first.id}`
-    const directUrl = await resolveDirectAudioUrl(videoUrl)
-    return downloadUrlToAudio(directUrl)
-  } catch (error) {
-    console.warn('[AI-Sync] Fallback YouTube/yt-dlp falhou:', error)
-    return null
+    if (title) params.set('title', title)
+    if (artist) params.set('artist', artist)
+    const proxyUrl = `${localOrigin()}/api/stream?${params.toString()}`
+    const viaProxy = await downloadUrlToAudio(proxyUrl)
+    if (viaProxy) return viaProxy
   }
+
+  // 2) Direto: YouTube search + yt-dlp (title + artist → buffer MP3/M4A)
+  for (const variant of searchVariants) {
+    try {
+      const results = await play.search(variant, {
+        limit: 1,
+        source: { youtube: 'video' },
+      })
+      const first = Array.isArray(results) ? results[0] : undefined
+      if (!first?.id) continue
+
+      const videoUrl = `https://www.youtube.com/watch?v=${first.id}`
+      const directUrl = await resolveDirectAudioUrl(videoUrl)
+      const downloaded = await downloadUrlToAudio(directUrl)
+      if (downloaded) return downloaded
+    } catch (error) {
+      console.warn(
+        `[AI-Sync] Fallback YouTube/yt-dlp falhou para "${variant}":`,
+        error,
+      )
+    }
+  }
+
+  console.warn('[AI-Sync] Nenhum resultado de áudio para fallback interno')
+  return null
 }
 
 async function captureAudio(options: {
@@ -367,12 +401,17 @@ function buildAlignmentPrompt(title: string, artist: string, lines: string[]) {
 Ignore intros instrumentais, beats sem voz, tags estruturais e ad-libs não listados.
 Use exatamente os índices fornecidos (0…${lines.length - 1}). Não invente linhas novas e não omita índices se a linha for cantada.
 
+IMPORTANTE — compatibilidade áudio↔letra:
+Retorne matchesAudio: true somente se a letra fornecida corresponder claramente à música ouvida.
+Retorne matchesAudio: false se a letra for claramente de outra música, for tradução intercalada, ou não bater com o que se ouve no áudio.
+Se matchesAudio for false, ainda assim pode devolver alignments vazios.
+
 Faixa: "${title}" — ${artist}
 
 Versos numerados:
 ${numbered}
 
-Responda apenas JSON: { "alignments": [{ "index": number, "startTime": number }] }`
+Responda apenas JSON: { "matchesAudio": boolean, "alignments": [{ "index": number, "startTime": number }] }`
 }
 
 export async function handleAiLyricsSync(req: Request, res: Response) {
@@ -461,6 +500,7 @@ export async function handleAiLyricsSync(req: Request, res: Response) {
         responseSchema: {
           type: Type.OBJECT,
           properties: {
+            matchesAudio: { type: Type.BOOLEAN },
             alignments: {
               type: Type.ARRAY,
               items: {
@@ -473,7 +513,7 @@ export async function handleAiLyricsSync(req: Request, res: Response) {
               },
             },
           },
-          required: ['alignments'],
+          required: ['matchesAudio', 'alignments'],
         },
       },
     })
@@ -485,6 +525,7 @@ export async function handleAiLyricsSync(req: Request, res: Response) {
     }
 
     let parsed: {
+      matchesAudio?: boolean
       alignments?: Array<{ index?: unknown; startTime?: unknown }>
     }
     try {
@@ -493,6 +534,20 @@ export async function handleAiLyricsSync(req: Request, res: Response) {
       res.status(200).json({
         fallback: true,
         reason: 'JSON inválido retornado pelo Gemini',
+      })
+      return
+    }
+
+    if (parsed.matchesAudio === false) {
+      console.warn(
+        `[AI-Sync] matchesAudio=false — letra não corresponde ao áudio de "${title}"`,
+      )
+      res.status(200).json({
+        matchesAudio: false,
+        syncedLines: [],
+        fallback: true,
+        reason:
+          'A letra encontrada não corresponde ao áudio da faixa. Tente trocar/buscar outra versão.',
       })
       return
     }
@@ -518,6 +573,7 @@ export async function handleAiLyricsSync(req: Request, res: Response) {
     res.status(200).json({
       syncedLines,
       source: 'gemini',
+      matchesAudio: true,
     })
   } catch (error) {
     console.error('[AI-Sync] Erro interno:', error)

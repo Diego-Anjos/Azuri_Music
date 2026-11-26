@@ -17,6 +17,13 @@ import {
   type EqBands,
 } from '../services/audioSettingsService'
 import { usePlayerStore } from '../store/usePlayerStore'
+import {
+  beginPlayRequest,
+  getPlayRequestId,
+  isPlayRequestCurrent,
+  registerPlaybackAudioElement,
+  resetNativeAudioElement,
+} from '../services/playbackGuard'
 
 type FilterBank = {
   subBass: BiquadFilterNode
@@ -42,6 +49,13 @@ type PlayerContextValue = {
   markExternalFallback: () => void
   /** Elemento <audio> ativo do player (para sync 60fps das letras). */
   getAudioElement: () => HTMLAudioElement | null
+  /**
+   * Inicia play request: incrementa id, aborta stream anterior e reseta <audio>.
+   * Usado para impedir troca cruzada de áudio entre cliques rápidos.
+   */
+  preparePlayRequest: () => { requestId: number; signal: AbortSignal }
+  /** true se o requestId ainda é o play ativo. */
+  isPlayRequestCurrent: (requestId: number) => boolean
 }
 
 const PlayerContext = createContext<PlayerContextValue | null>(null)
@@ -58,6 +72,7 @@ export function getPlayerAudioElement(): HTMLAudioElement | null {
 
 export function registerPlayerAudioElement(el: HTMLAudioElement | null) {
   sharedAudioElement = el
+  registerPlaybackAudioElement(el)
 }
 
 function applyEqGains(filters: FilterBank, gains: EqBands) {
@@ -176,7 +191,14 @@ export function PlayerProvider({
 }: PlayerProviderProps) {
   const [isEqActive, setIsEqActive] = useState(false)
   const graphRef = useRef<AudioGraph | null>(null)
+  /** Espelha o contador global — evita áudio stale ao trocar de faixa. */
+  const playRequestIdRef = useRef(0)
   const setStoreEqActive = usePlayerStore((s) => s.setEqActive)
+  const storePlayRequestId = usePlayerStore((s) => s.playRequestId)
+
+  useEffect(() => {
+    playRequestIdRef.current = storePlayRequestId || getPlayRequestId()
+  }, [storePlayRequestId])
 
   const syncEqFlag = useCallback(
     (active: boolean) => {
@@ -202,10 +224,24 @@ export function PlayerProvider({
     }
   }, [])
 
+  const preparePlayRequest = useCallback(() => {
+    const { requestId, signal } = beginPlayRequest()
+    playRequestIdRef.current = requestId
+    resetNativeAudioElement(audioRef.current)
+    return { requestId, signal }
+  }, [audioRef])
+
+  const checkPlayRequestCurrent = useCallback((requestId: number) => {
+    return (
+      requestId === playRequestIdRef.current && isPlayRequestCurrent(requestId)
+    )
+  }, [])
+
+  // Sem stream: limpa o <audio> nativo para não continuar tocando faixa anterior
   useEffect(() => {
     registerPlayerAudioElement(audioRef.current)
-
     if (!streamUrl) {
+      resetNativeAudioElement(audioRef.current)
       graphRef.current = null
       syncEqFlag(false)
       return
@@ -295,8 +331,17 @@ export function PlayerProvider({
       resumeAudioContext,
       markExternalFallback,
       getAudioElement,
+      preparePlayRequest,
+      isPlayRequestCurrent: checkPlayRequestCurrent,
     }),
-    [isEqActive, resumeAudioContext, markExternalFallback, getAudioElement],
+    [
+      isEqActive,
+      resumeAudioContext,
+      markExternalFallback,
+      getAudioElement,
+      preparePlayRequest,
+      checkPlayRequestCurrent,
+    ],
   )
 
   return (
@@ -312,6 +357,8 @@ export function usePlayerAudio(): PlayerContextValue {
       resumeAudioContext: async () => undefined,
       markExternalFallback: () => undefined,
       getAudioElement: () => sharedAudioElement,
+      preparePlayRequest: () => beginPlayRequest(),
+      isPlayRequestCurrent,
     }
   }
   return ctx

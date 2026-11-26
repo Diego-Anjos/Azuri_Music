@@ -3,6 +3,7 @@ import {
   getLikedTracks,
 } from './libraryStorage'
 import {
+  isSpotifyInCooldown,
   searchCatalog,
   searchTracksByQuery,
   type SpotifyArtist,
@@ -305,6 +306,7 @@ export function clearHomeRecommendationsCache() {
 }
 
 async function searchTracksSafe(query: string, limit: number): Promise<SpotifyTrack[]> {
+  if (isSpotifyInCooldown()) return []
   try {
     return await searchTracksByQuery(query, limit)
   } catch {
@@ -313,10 +315,24 @@ async function searchTracksSafe(query: string, limit: number): Promise<SpotifyTr
 }
 
 async function searchCatalogSafe(query: string) {
+  if (isSpotifyInCooldown()) {
+    return { tracks: [] as SpotifyTrack[], artists: [] as SpotifyArtist[], playlists: [] }
+  }
   try {
     return await searchCatalog(query)
   } catch {
     return { tracks: [] as SpotifyTrack[], artists: [] as SpotifyArtist[], playlists: [] }
+  }
+}
+
+function emptyPersonalizedHomeData(seedGenres: string[]): PersonalizedHomeData {
+  return {
+    featuredRelease: null,
+    personalizedMixes: [],
+    becauseYouListened: null,
+    suggestedArtists: [],
+    newTracks: [],
+    seedGenres,
   }
 }
 
@@ -344,6 +360,13 @@ export async function getPersonalizedHomeData(options?: {
   if (!options?.forceRefresh) {
     const cached = readHomeCache(favoriteGenres)
     if (cached) return cached
+  }
+
+  // Não dispara novas buscas Spotify enquanto o circuit breaker 429 estiver ativo
+  if (isSpotifyInCooldown()) {
+    const cached = readHomeCache(favoriteGenres)
+    if (cached) return cached
+    return emptyPersonalizedHomeData(favoriteGenres)
   }
 
   const history = getListeningHistory()

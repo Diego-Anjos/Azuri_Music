@@ -34,7 +34,7 @@ import {
 } from '../services/lyricsService'
 import { usePlayerStore } from '../store/usePlayerStore'
 
-type AiSyncUiStatus = 'idle' | 'listening' | 'done' | 'error'
+type AiSyncUiStatus = 'idle' | 'listening' | 'done' | 'error' | 'mismatch'
 
 const ICON_STROKE = 1.5
 const OFFSET_STEP = 0.5
@@ -66,11 +66,36 @@ function findActiveLineIndex(lines: LyricLine[], currentTime: number): number {
   return active
 }
 
-function readAudioClock(
-  storeProgress: number,
-  storeDuration: number,
-): { currentTime: number; duration: number } {
+/** <audio> nativo realmente em reprodução (não o stub parado do fallback YouTube). */
+function isActiveNativeAudio(
+  audio: HTMLAudioElement | null,
+): audio is HTMLAudioElement {
+  return Boolean(
+    audio &&
+      !audio.paused &&
+      audio.readyState >= 2 &&
+      Number.isFinite(audio.currentTime) &&
+      audio.currentTime > 0,
+  )
+}
+
+type StoreClockSample = {
+  baseTime: number
+  basePerf: number
+  duration: number
+  isPlaying: boolean
+}
+
+/**
+ * Relógio híbrido: prioriza <audio> nativo; no fallback YouTube interpola o
+ * currentTime do player (progress × duration) com performance.now() a 60fps.
+ */
+function readHybridClock(store: StoreClockSample): {
+  currentTime: number
+  duration: number
+} {
   const audio = getPlayerAudioElement()
+
   const audioDuration =
     audio && Number.isFinite(audio.duration) && audio.duration > 0
       ? audio.duration
@@ -78,16 +103,44 @@ function readAudioClock(
   const duration =
     audioDuration > 0
       ? audioDuration
-      : storeDuration > 0
-        ? storeDuration
+      : store.duration > 0
+        ? store.duration
         : 0
-  const currentTime =
-    audio && Number.isFinite(audio.currentTime)
-      ? audio.currentTime
-      : duration > 0
-        ? storeProgress * duration
-        : 0
+
+  if (isActiveNativeAudio(audio)) {
+    return { currentTime: audio.currentTime, duration }
+  }
+
+  let currentTime = store.baseTime
+  if (store.isPlaying) {
+    currentTime += (performance.now() - store.basePerf) / 1000
+  }
+
+  if (duration > 0) {
+    currentTime = Math.min(Math.max(0, currentTime), duration)
+  } else {
+    currentTime = Math.max(0, currentTime)
+  }
+
   return { currentTime, duration }
+}
+
+/** Compat: leituras pontuais a partir do estado Zustand (progress 0–1). */
+function readAudioClock(
+  storeProgress: number,
+  storeDuration: number,
+  playing = false,
+): { currentTime: number; duration: number } {
+  const baseTime =
+    storeDuration > 0 && Number.isFinite(storeProgress)
+      ? storeProgress * storeDuration
+      : 0
+  return readHybridClock({
+    baseTime,
+    basePerf: performance.now(),
+    duration: storeDuration,
+    isPlaying: playing,
+  })
 }
 
 export function LyricsView() {
@@ -117,6 +170,8 @@ export function LyricsView() {
   const [activeLineIndex, setActiveLineIndex] = useState(-1)
   const [clockTime, setClockTime] = useState(0)
   const [aiSyncStatus, setAiSyncStatus] = useState<AiSyncUiStatus>('idle')
+  const [isAiSyncing, setIsAiSyncing] = useState(false)
+  const [backendOffline, setBackendOffline] = useState(false)
 
   const lineRefs = useRef<(HTMLButtonElement | null)[]>([])
   const scrollContainerRef = useRef<HTMLDivElement | null>(null)
@@ -128,9 +183,19 @@ export function LyricsView() {
   const currentTimeRef = useRef(0)
   const syncOffsetRef = useRef(0)
   const trackIdRef = useRef<string | null>(null)
+  /** Faixa ativa para a qual a UI pode aplicar resultados de letra/AI-sync. */
+  const activeTrackIdRef = useRef<string | null>(null)
+  const lyricsAbortRef = useRef<AbortController | null>(null)
+  const aiSyncAbortRef = useRef<AbortController | null>(null)
   const lastSmartDurationRef = useRef(0)
   const autoAiKeyRef = useRef<string | null>(null)
   const aiSyncInFlightRef = useRef(false)
+  const storeClockRef = useRef<StoreClockSample>({
+    baseTime: 0,
+    basePerf: performance.now(),
+    duration: 0,
+    isPlaying: false,
+  })
 
   const coverUrl = currentTrack?.album?.images?.[0]?.url
   const title = currentTrack?.name ?? 'Nenhuma música'
@@ -154,8 +219,25 @@ export function LyricsView() {
   currentTimeRef.current = clockTime
   trackIdRef.current = currentTrack?.id ?? null
 
+  // Só rebases quando o player store muda — NÃO a cada frame do RAF
   useEffect(() => {
+    storeClockRef.current = {
+      baseTime:
+        duration > 0 && Number.isFinite(progress) ? progress * duration : 0,
+      basePerf: performance.now(),
+      duration: duration > 0 ? duration : 0,
+      isPlaying,
+    }
+  }, [progress, duration, isPlaying, currentTrack?.id])
+
+  useEffect(() => {
+    // Aborta buscas / AI-sync da faixa anterior imediatamente
+    lyricsAbortRef.current?.abort()
+    aiSyncAbortRef.current?.abort()
+    aiSyncInFlightRef.current = false
+
     if (!currentTrack) {
+      activeTrackIdRef.current = null
       setLyrics(null)
       setError(null)
       setLoading(false)
@@ -171,12 +253,36 @@ export function LyricsView() {
       setManualError(null)
       setManualSearching(false)
       setManualLoadingId(null)
+      setAiSyncStatus('idle')
+      setIsAiSyncing(false)
+      setBackendOffline(false)
       tappedLinesRef.current = []
       lastSmartDurationRef.current = 0
       return
     }
 
-    setSyncOffset(readLyricsTiming(currentTrack.id).offsetSeconds)
+    const targetTrackId = currentTrack.id
+    activeTrackIdRef.current = targetTrackId
+
+    const controller = new AbortController()
+    lyricsAbortRef.current = controller
+
+    // Limpa versos antigos antes de carregar a nova música
+    setLyrics(null)
+    setError(null)
+    setLoading(true)
+    setShowPaste(false)
+    setPasteText('')
+    setTapSyncActive(false)
+    setTapIndex(0)
+    tappedLinesRef.current = []
+    lastActiveRef.current = -1
+    lastSmartDurationRef.current = 0
+    setAiSyncStatus('idle')
+    setIsAiSyncing(false)
+    setActiveLineIndex(-1)
+
+    setSyncOffset(readLyricsTiming(targetTrackId).offsetSeconds)
     setManualTitle(cleanTrackTitle(currentTrack.name) || currentTrack.name)
     setManualArtist(
       primaryArtistName(
@@ -185,24 +291,9 @@ export function LyricsView() {
     )
     setManualCandidates([])
     setManualError(null)
-    setAiSyncStatus('idle')
     autoAiKeyRef.current = null
 
-    let cancelled = false
-
     async function load() {
-      setLoading(true)
-      setError(null)
-      setShowPaste(false)
-      setPasteText('')
-      setLyrics(null)
-      setTapSyncActive(false)
-      setTapIndex(0)
-      tappedLinesRef.current = []
-      lastActiveRef.current = -1
-      lastSmartDurationRef.current = 0
-      setAiSyncStatus('idle')
-
       const { duration: audioDuration } = readAudioClock(
         usePlayerStore.getState().progress,
         usePlayerStore.getState().duration,
@@ -213,26 +304,32 @@ export function LyricsView() {
           : currentTrack!.duration_ms
 
       let result = await fetchLyrics({
-        trackId: currentTrack!.id,
+        trackId: targetTrackId,
         trackName: currentTrack!.name,
         artistName: currentTrack!.artists?.[0]?.name ?? '',
         albumName: currentTrack!.album?.name,
         durationMs,
+        signal: controller.signal,
       })
 
-      if (
-        !cancelled &&
-        result?.isEstimated &&
-        audioDuration > 0
-      ) {
+      if (activeTrackIdRef.current !== targetTrackId || controller.signal.aborted) {
+        return
+      }
+
+      if (result?.isEstimated && audioDuration > 0) {
         result = await recalculateSmartSyncWithAudio(result, audioDuration, {
           audioUrl: usePlayerStore.getState().localAudioUrl,
           audioElement: getPlayerAudioElement(),
         })
+        if (activeTrackIdRef.current !== targetTrackId || controller.signal.aborted) {
+          return
+        }
         lastSmartDurationRef.current = audioDuration
       }
 
-      if (cancelled) return
+      if (activeTrackIdRef.current !== targetTrackId || controller.signal.aborted) {
+        return
+      }
 
       const hasVerses = Boolean(result && result.lines.length > 0)
       setLyrics(hasVerses ? result : null)
@@ -244,18 +341,18 @@ export function LyricsView() {
     void load()
 
     return () => {
-      cancelled = true
+      controller.abort()
     }
   }, [currentTrack?.id])
 
-  // Clock 60fps a partir do <audio> real (não depende de timeupdate ~4Hz)
+  // Clock 60fps: <audio> nativo OU interpolação do progresso do player (YouTube)
   useEffect(() => {
     let raf = 0
     let running = true
 
     const tick = () => {
       if (!running) return
-      const { currentTime: now } = readAudioClock(progress, duration)
+      const { currentTime: now } = readHybridClock(storeClockRef.current)
       setClockTime(now)
 
       const current = lyricsRef.current
@@ -291,10 +388,11 @@ export function LyricsView() {
       running = false
       if (raf) window.cancelAnimationFrame(raf)
     }
-  }, [isPlaying, tapSyncActive, progress, duration, lyrics?.lines])
+  }, [isPlaying, tapSyncActive, lyrics?.lines])
 
   // Quando o player revela a duração real, recalcula smart sync com análise vocal
   useEffect(() => {
+    const targetTrackId = currentTrack?.id ?? null
     const { duration: audioDuration } = readAudioClock(progress, duration)
     if (audioDuration <= 0) return
     if (Math.abs(audioDuration - lastSmartDurationRef.current) < 0.5) return
@@ -309,8 +407,15 @@ export function LyricsView() {
         audioUrl: localAudioUrl,
         audioElement: getPlayerAudioElement(),
       })
-      // Não sobrescrever se o Gemini já alinhou enquanto recalculávamos
-      if (!cancelled && !lyricsRef.current?.isAiSynced) setLyrics(next)
+      // Não sobrescrever se o Gemini já alinhou ou a faixa mudou
+      if (
+        cancelled ||
+        activeTrackIdRef.current !== targetTrackId ||
+        lyricsRef.current?.isAiSynced
+      ) {
+        return
+      }
+      setLyrics(next)
     })()
 
     return () => {
@@ -416,40 +521,95 @@ export function LyricsView() {
     if (aiSyncInFlightRef.current) return
     if (!options?.force && lyrics.isAiSynced) return
 
+    const targetTrackId = currentTrack.id
     const plainLines = getPlainLyricLines(lyrics)
     if (plainLines.length === 0) {
       setAiSyncStatus('error')
       return
     }
 
+    aiSyncAbortRef.current?.abort()
+    const controller = new AbortController()
+    aiSyncAbortRef.current = controller
+
     const audioSrc = resolveCurrentAudioSrc()
-    const { duration: audioDuration } = readAudioClock(progress, duration)
+    const { duration: audioDuration } = readAudioClock(
+      progress,
+      duration,
+      isPlaying,
+    )
     aiSyncInFlightRef.current = true
+    setIsAiSyncing(true)
     setAiSyncStatus('listening')
+    setBackendOffline(false)
 
-    const next = await syncLyricsWithGemini(currentTrack, plainLines, audioSrc, {
-      force: options?.force === true,
-      durationSec:
-        audioDuration > 0
-          ? audioDuration
-          : (currentTrack.duration_ms ?? 0) > 0
-            ? currentTrack.duration_ms! / 1000
-            : undefined,
-    })
+    try {
+      const outcome = await syncLyricsWithGemini(
+        currentTrack,
+        plainLines,
+        audioSrc,
+        {
+          force: options?.force === true,
+          signal: controller.signal,
+          durationSec:
+            audioDuration > 0
+              ? audioDuration
+              : (currentTrack.duration_ms ?? 0) > 0
+                ? currentTrack.duration_ms! / 1000
+                : undefined,
+        },
+      )
 
-    aiSyncInFlightRef.current = false
+      if (
+        activeTrackIdRef.current !== targetTrackId ||
+        controller.signal.aborted ||
+        outcome.status === 'aborted'
+      ) {
+        return
+      }
 
-    if (!next) {
+      if (outcome.status === 'mismatch') {
+        setAiSyncStatus('mismatch')
+        setError(
+          outcome.reason ||
+            'A letra encontrada não corresponde ao áudio desta faixa. Troque ou busque outra versão.',
+        )
+        return
+      }
+
+      if (outcome.status !== 'ok') {
+        setAiSyncStatus('error')
+        return
+      }
+
+      if (activeTrackIdRef.current !== targetTrackId) return
+
+      // Atualiza versos + zera offset antigo para não desalinear a IA
+      setLyrics(outcome.lyrics)
+      setSyncOffset(0)
+      persistOffset(0)
+      lastActiveRef.current = -1
+      setAiSyncStatus('done')
+      setError(null)
+    } catch (error) {
+      if (activeTrackIdRef.current !== targetTrackId) return
+      const message =
+        error instanceof Error ? error.message : String(error ?? '')
+      const offline =
+        /failed to fetch|networkerror|load failed|err_connection/i.test(
+          message,
+        ) || error instanceof TypeError
+
+      if (offline) {
+        setBackendOffline(true)
+      }
       setAiSyncStatus('error')
-      return
+    } finally {
+      if (activeTrackIdRef.current === targetTrackId) {
+        setIsAiSyncing(false)
+        aiSyncInFlightRef.current = false
+      }
     }
-
-    // Atualiza versos + zera offset antigo para não desalinear a IA
-    setLyrics(next)
-    setSyncOffset(0)
-    persistOffset(0)
-    lastActiveRef.current = -1
-    setAiSyncStatus('done')
   }
 
   // Upgrade automático: mostra a letra na hora e sincroniza com Gemini em background
@@ -738,6 +898,15 @@ export function LyricsView() {
           </button>
         </div>
 
+        {backendOffline && (
+          <p
+            role="status"
+            className="mt-2 text-[11px] text-amber-200/80"
+          >
+            Backend offline (porta 3001) — inicie o servidor para usar a IA.
+          </p>
+        )}
+
         {showSyncToolbar && (
           <div className="no-scrollbar mt-3 flex items-center gap-2 overflow-x-auto border-t border-white/5 pt-3">
             {isExactSync ? (
@@ -774,7 +943,7 @@ export function LyricsView() {
               </span>
             ) : null}
 
-            {aiSyncStatus === 'listening' ? (
+            {isAiSyncing || aiSyncStatus === 'listening' ? (
               <span className="inline-flex shrink-0 animate-pulse items-center gap-1.5 rounded-full border border-violet-400/50 bg-gradient-to-r from-cyan-400/20 to-violet-500/25 px-3 py-1 text-[11px] font-semibold whitespace-nowrap text-cyan-100">
                 <Sparkles
                   className="size-3.5 text-cyan-300"
@@ -782,6 +951,15 @@ export function LyricsView() {
                 />
                 Ouvindo faixa...
               </span>
+            ) : aiSyncStatus === 'mismatch' ? (
+              <button
+                type="button"
+                onClick={handleSwapLyrics}
+                title="A letra não corresponde ao áudio — buscar outra versão"
+                className="inline-flex shrink-0 items-center gap-1.5 rounded-full border border-amber-400/50 bg-amber-400/10 px-3 py-1 text-[11px] font-semibold whitespace-nowrap text-amber-200 transition-colors hover:border-amber-300/70 hover:bg-amber-400/20"
+              >
+                Letra ≠ áudio — trocar
+              </button>
             ) : isAiSynced || aiSyncStatus === 'done' ? (
               <button
                 type="button"

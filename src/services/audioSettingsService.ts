@@ -290,10 +290,35 @@ export function getEffectiveEqGains(settings: AudioSettings): EqBands {
   }
 }
 
+export type StreamProxyParams = {
+  query: string
+  title?: string
+  artist?: string
+  /** Duração esperada em segundos (trava de matching no backend). */
+  duration?: number
+  quality?: AudioQuality
+}
+
 /** URL do proxy CORS no backend para Web Audio API. */
-export function buildStreamProxyUrl(query: string, quality?: AudioQuality): string {
-  const q = quality ?? getAudioSettings().quality
-  return `http://localhost:3001/api/stream?query=${encodeURIComponent(query.trim())}&quality=${encodeURIComponent(q)}`
+export function buildStreamProxyUrl(
+  queryOrParams: string | StreamProxyParams,
+  quality?: AudioQuality,
+): string {
+  const params: StreamProxyParams =
+    typeof queryOrParams === 'string'
+      ? { query: queryOrParams, quality }
+      : queryOrParams
+
+  const q = params.quality ?? quality ?? getAudioSettings().quality
+  const search = new URLSearchParams()
+  search.set('query', params.query.trim())
+  if (params.title?.trim()) search.set('title', params.title.trim())
+  if (params.artist?.trim()) search.set('artist', params.artist.trim())
+  if (params.duration && params.duration > 0) {
+    search.set('duration', String(Math.round(params.duration)))
+  }
+  search.set('quality', q)
+  return `http://localhost:3001/api/stream?${search.toString()}`
 }
 
 export function isStreamProxyUrl(url: string | null | undefined): boolean {

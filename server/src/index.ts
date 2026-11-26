@@ -13,6 +13,8 @@ import {
   cleanLyricsTitle,
   durationClose,
   isArtistMatch,
+  isStrictTrackMatch,
+  isTranslationMetadata,
   isValidLyricsText,
   tokenSimilarity,
   type LyricsSearchVariant,
@@ -459,33 +461,50 @@ async function resolveArtistMeta(name: string): Promise<ArtistMetaPayload> {
   return { ...EMPTY_ARTIST_META }
 }
 
-type StreamQuality = 'low' | 'medium' | 'high' | 'ultra'
+type StreamQuality = 'low' | 'normal' | 'medium' | 'high' | 'ultra' | 'hifi'
 
 function parseStreamQuality(value: unknown): StreamQuality {
+  const raw =
+    typeof value === 'string' ? value.trim().toLowerCase() : ''
   if (
-    value === 'low' ||
-    value === 'medium' ||
-    value === 'high' ||
-    value === 'ultra'
+    raw === 'low' ||
+    raw === 'normal' ||
+    raw === 'medium' ||
+    raw === 'high' ||
+    raw === 'ultra' ||
+    raw === 'hifi'
   ) {
-    return value
+    return raw
   }
   return 'high'
 }
 
-/** Seleção de bitrate via yt-dlp (abr ≈ kbps). */
+/** Seleção de bitrate via yt-dlp (abr ≈ kbps). Aceita low/normal/high/ultra/hifi. */
 function qualityToYtDlpFormat(quality: StreamQuality): string {
   switch (quality) {
     case 'low':
       return 'bestaudio[abr<=96]/bestaudio[abr<=128]/bestaudio'
+    case 'normal':
     case 'medium':
       return 'bestaudio[abr<=160]/bestaudio'
+    case 'hifi':
     case 'ultra':
       return 'bestaudio/best'
     case 'high':
     default:
       return 'bestaudio[abr<=256]/bestaudio'
   }
+}
+
+/** Remove sufixos comuns de busca (official, lyrics, audio…) para retry. */
+function stripStreamQuerySuffixes(query: string): string {
+  return query
+    .replace(
+      /\b(official\s*(audio|video|music\s*video)?|lyrics?|audio|mv|hd|4k|visualizer|topic)\b/gi,
+      ' ',
+    )
+    .replace(/\s+/g, ' ')
+    .trim()
 }
 
 function guessMimeFromUrl(url: string): string {
@@ -514,18 +533,398 @@ function setStreamCorsHeaders(res: express.Response) {
   res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin')
 }
 
-async function resolveYoutubeResult(query: string) {
-  const results = await play.search(query.trim(), {
-    limit: 1,
-    source: { youtube: 'video' },
-  })
-  const firstResult = Array.isArray(results) ? results[0] : undefined
-  if (!firstResult?.id) return null
-  return {
-    videoId: firstResult.id,
-    title: firstResult.title,
-    url: `https://www.youtube.com/watch?v=${firstResult.id}`,
+/* -------------------------------------------------------------------------- */
+/*  Stream match: multi-candidato + score (título / artista / duração)         */
+/* -------------------------------------------------------------------------- */
+
+type StreamCandidate = {
+  id: string
+  title: string
+  url: string
+  duration: number
+  channel?: string
+  source: 'youtube' | 'soundcloud'
+}
+
+type ResolvedStream = {
+  videoId: string
+  title: string
+  url: string
+  duration: number
+  source: 'youtube' | 'soundcloud'
+  score: number
+}
+
+type StreamResolveInput = {
+  query: string
+  title?: string
+  artist?: string
+  expectedDuration?: number
+}
+
+const STREAM_RESOLVE_CACHE_TTL_MS = 1000 * 60 * 45
+const streamResolveCache = new Map<
+  string,
+  { at: number; value: ResolvedStream }
+>()
+
+const STREAM_CONTEXT_BLOCKLIST = [
+  'full album',
+  'full mixtape',
+  'cypher',
+  'slowed',
+  'sped up',
+  'speed up',
+  'nightcore',
+  'instrumental',
+  'karaoke',
+  'remix',
+  'mashup',
+  'bootleg',
+  'cover',
+  'live session',
+  'live performance',
+  'reaction',
+  'tracklist',
+  'compilation',
+] as const
+
+function normalizeStreamText(value: string): string {
+  return value
+    .normalize('NFD')
+    .replace(/\p{M}/gu, '')
+    .toLowerCase()
+    .replace(
+      /\b(official\s*(audio|video|music\s*video|lyric\s*video)?|lyrics?|audio|visuali[sz]er|topic|hd|4k|mv|prod\.?|produced by|prod by|feat\.?|ft\.?|featuring)\b/gi,
+      ' ',
+    )
+    .replace(/[([{][^)\]}]*[)\]}]/g, ' ')
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function streamTitleTokens(value: string): string[] {
+  return normalizeStreamText(value)
+    .split(/\s+/)
+    .filter((token) => token.length >= 2)
+}
+
+function hasBlockedStreamContext(
+  candidateTitle: string,
+  expectedTitle: string,
+): boolean {
+  const candidate = normalizeStreamText(candidateTitle)
+  const expected = normalizeStreamText(expectedTitle)
+  for (const phrase of STREAM_CONTEXT_BLOCKLIST) {
+    if (candidate.includes(phrase) && !expected.includes(phrase)) {
+      return true
+    }
   }
+  return false
+}
+
+function titleKeywordsPresent(
+  expectedTitle: string,
+  candidateTitle: string,
+): boolean {
+  const expectedTokens = streamTitleTokens(expectedTitle)
+  if (expectedTokens.length === 0) return true
+  const candidateNorm = normalizeStreamText(candidateTitle)
+  const candidateSet = new Set(streamTitleTokens(candidateTitle))
+  const significant = expectedTokens.filter(
+    (token) => token.length >= 3 || expectedTokens.length <= 2,
+  )
+  if (significant.length === 0) return true
+  const hits = significant.filter(
+    (token) => candidateSet.has(token) || candidateNorm.includes(token),
+  )
+  // Exige a maioria das palavras-chave do título
+  return hits.length >= Math.ceil(significant.length * 0.7)
+}
+
+/**
+ * Pontua candidato YouTube/SoundCloud vs metadados esperados.
+ * Retorna -Infinity para rejeição dura.
+ */
+function scoreStreamCandidate(
+  candidate: StreamCandidate,
+  expectedTitle: string,
+  expectedArtist: string,
+  expectedDuration: number,
+): number {
+  if (!candidate.title?.trim() || !candidate.url) return Number.NEGATIVE_INFINITY
+
+  if (expectedTitle && hasBlockedStreamContext(candidate.title, expectedTitle)) {
+    return Number.NEGATIVE_INFINITY
+  }
+
+  if (expectedTitle && !titleKeywordsPresent(expectedTitle, candidate.title)) {
+    return Number.NEGATIVE_INFINITY
+  }
+
+  let score = 0
+
+  if (expectedTitle) {
+    score += tokenSimilarity(expectedTitle, candidate.title) * 40
+  }
+
+  if (expectedArtist) {
+    const inTitle = isArtistMatch(expectedArtist, candidate.title)
+    const inChannel = candidate.channel
+      ? isArtistMatch(expectedArtist, candidate.channel)
+      : false
+    if (inTitle || inChannel) {
+      score += inTitle && inChannel ? 35 : 25
+    } else {
+      score -= 20
+    }
+  }
+
+  if (expectedDuration > 0) {
+    const candDur = candidate.duration > 0 ? candidate.duration : 0
+    if (candDur <= 0) {
+      score -= 8
+    } else {
+      const diff = Math.abs(candDur - expectedDuration)
+      if (diff <= 4) score += 40
+      else if (diff <= 8) score += 28
+      else if (diff <= 15) score += 12
+      else if (diff <= 25) score -= 25
+      else return Number.NEGATIVE_INFINITY
+    }
+  }
+
+  // Prefere YouTube topic / áudio curto vs uploads longos sem duração esperada
+  if (expectedDuration <= 0 && candidate.duration > 0) {
+    if (candidate.duration > 60 * 12) score -= 30
+    else if (candidate.duration <= 60 * 8) score += 4
+  }
+
+  if (candidate.source === 'soundcloud') score += 2
+
+  return score
+}
+
+function streamCacheKey(input: StreamResolveInput): string {
+  const artist = (input.artist ?? '').trim().toLowerCase()
+  const title = (input.title ?? input.query).trim().toLowerCase()
+  const duration =
+    input.expectedDuration && input.expectedDuration > 0
+      ? Math.round(input.expectedDuration)
+      : 0
+  return `v2::${artist}::${title}::${duration}`
+}
+
+function parseExpectedDuration(value: unknown): number {
+  if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+    return value
+  }
+  if (typeof value === 'string' && value.trim()) {
+    const n = Number(value)
+    if (Number.isFinite(n) && n > 0) return n
+  }
+  return 0
+}
+
+function readStreamQueryInput(req: express.Request): StreamResolveInput | null {
+  const queryRaw = req.query.query
+  const titleRaw = req.query.title
+  const artistRaw = req.query.artist
+
+  const title =
+    typeof titleRaw === 'string' && titleRaw.trim() ? titleRaw.trim() : ''
+  const artist =
+    typeof artistRaw === 'string' && artistRaw.trim() ? artistRaw.trim() : ''
+  const query =
+    typeof queryRaw === 'string' && queryRaw.trim()
+      ? queryRaw.trim()
+      : [artist, title].filter(Boolean).join(' - ').trim()
+
+  if (!query) return null
+
+  return {
+    query,
+    title: title || undefined,
+    artist: artist || undefined,
+    expectedDuration: parseExpectedDuration(req.query.duration),
+  }
+}
+
+async function searchYoutubeCandidates(
+  searchQuery: string,
+): Promise<StreamCandidate[]> {
+  try {
+    const results = await play.search(searchQuery, {
+      limit: 5,
+      source: { youtube: 'video' },
+    })
+    if (!Array.isArray(results)) return []
+    return results
+      .filter((item) => item?.id)
+      .map((item) => ({
+        id: String(item.id),
+        title: item.title ?? '',
+        url: `https://www.youtube.com/watch?v=${item.id}`,
+        duration: Number(item.durationInSec) || 0,
+        channel: item.channel?.name ?? undefined,
+        source: 'youtube' as const,
+      }))
+  } catch (error) {
+    console.warn(`[stream] ytsearch5 falhou para "${searchQuery}":`, error)
+    return []
+  }
+}
+
+async function searchSoundCloudCandidates(
+  searchQuery: string,
+): Promise<StreamCandidate[]> {
+  try {
+    const clientId = await getSoundCloudClientId()
+    if (!clientId) return []
+    const apiUrl = `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(searchQuery)}&client_id=${clientId}&limit=5&app_locale=en`
+    const res = await fetch(apiUrl, { headers: SC_HEADERS })
+    if (!res.ok) return []
+    const data = (await res.json()) as {
+      collection?: Array<{
+        id?: number
+        title?: string
+        duration?: number
+        permalink_url?: string
+        user?: { username?: string }
+      }> | null
+    }
+    return (data.collection ?? [])
+      .filter((track) => track.permalink_url && track.title)
+      .map((track) => ({
+        id: `sc-${track.id ?? track.permalink_url}`,
+        title: track.title ?? '',
+        url: track.permalink_url as string,
+        duration:
+          typeof track.duration === 'number' && track.duration > 0
+            ? Math.round(track.duration / 1000)
+            : 0,
+        channel: track.user?.username,
+        source: 'soundcloud' as const,
+      }))
+  } catch (error) {
+    console.warn(`[stream] SoundCloud search falhou para "${searchQuery}":`, error)
+    return []
+  }
+}
+
+function pickBestStreamCandidate(
+  candidates: StreamCandidate[],
+  expectedTitle: string,
+  expectedArtist: string,
+  expectedDuration: number,
+): ResolvedStream | null {
+  let best: { candidate: StreamCandidate; score: number } | null = null
+
+  for (const candidate of candidates) {
+    const score = scoreStreamCandidate(
+      candidate,
+      expectedTitle,
+      expectedArtist,
+      expectedDuration,
+    )
+    if (!Number.isFinite(score) || score === Number.NEGATIVE_INFINITY) continue
+    if (!best || score > best.score) {
+      best = { candidate, score }
+    }
+  }
+
+  // Sem duração esperada, aceita o melhor score; com duração, exige score mínimo
+  if (!best) return null
+  if (expectedDuration > 0 && best.score < 20) return null
+  if (expectedDuration <= 0 && best.score < 5) return null
+
+  return {
+    videoId: best.candidate.id,
+    title: best.candidate.title,
+    url: best.candidate.url,
+    duration: best.candidate.duration,
+    source: best.candidate.source,
+    score: best.score,
+  }
+}
+
+async function resolveStreamResult(
+  input: StreamResolveInput,
+): Promise<ResolvedStream | null> {
+  const cacheKey = streamCacheKey(input)
+  const cached = streamResolveCache.get(cacheKey)
+  if (cached && Date.now() - cached.at < STREAM_RESOLVE_CACHE_TTL_MS) {
+    return cached.value
+  }
+
+  const expectedTitle = (input.title ?? input.query).trim()
+  const expectedArtist = (input.artist ?? '').trim()
+  const expectedDuration =
+    input.expectedDuration && input.expectedDuration > 0
+      ? input.expectedDuration
+      : 0
+
+  const primaryQuery =
+    expectedArtist && input.title
+      ? `${expectedArtist} - ${input.title}`
+      : input.query.trim()
+
+  const stripped = stripStreamQuerySuffixes(primaryQuery)
+  const searchVariants = [
+    primaryQuery,
+    `${primaryQuery} audio`,
+    expectedArtist && input.title
+      ? `${expectedArtist} ${input.title}`
+      : null,
+    stripped && stripped.toLowerCase() !== primaryQuery.toLowerCase()
+      ? stripped
+      : null,
+  ].filter((item): item is string => Boolean(item))
+
+  const uniqueQueries = [...new Set(searchVariants)]
+  const seenIds = new Set<string>()
+  const candidates: StreamCandidate[] = []
+
+  for (const q of uniqueQueries) {
+    const [yt, sc] = await Promise.all([
+      searchYoutubeCandidates(q),
+      searchSoundCloudCandidates(q),
+    ])
+    for (const candidate of [...yt, ...sc]) {
+      if (seenIds.has(candidate.id)) continue
+      seenIds.add(candidate.id)
+      candidates.push(candidate)
+    }
+    // Já temos candidatos suficientes para pontuar
+    if (candidates.length >= 8) break
+  }
+
+  const best = pickBestStreamCandidate(
+    candidates,
+    expectedTitle,
+    expectedArtist,
+    expectedDuration,
+  )
+
+  if (!best) {
+    console.warn(
+      `[stream] Nenhum candidato válido para "${primaryQuery}" (duration=${expectedDuration || 'n/a'})`,
+    )
+    return null
+  }
+
+  console.log(
+    `[stream] Match score=${best.score.toFixed(1)} source=${best.source} dur=${best.duration}s → "${best.title}"`,
+  )
+
+  streamResolveCache.set(cacheKey, { at: Date.now(), value: best })
+  return best
+}
+
+/** @deprecated nome legado — usa resolveStreamResult com score multi-candidato. */
+async function resolveYoutubeResult(query: string) {
+  return resolveStreamResult({ query })
 }
 
 /** Resolve URL direta de áudio com yt-dlp (play-dl cipher está quebrado no YT atual). */
@@ -649,17 +1048,34 @@ async function proxyAudioFromUrl(
   }
 }
 
+function buildStreamProxyPath(
+  input: StreamResolveInput,
+  quality: StreamQuality,
+): string {
+  const params = new URLSearchParams()
+  params.set('query', input.query)
+  if (input.title) params.set('title', input.title)
+  if (input.artist) params.set('artist', input.artist)
+  if (input.expectedDuration && input.expectedDuration > 0) {
+    params.set('duration', String(Math.round(input.expectedDuration)))
+  }
+  params.set('quality', quality)
+  return `/api/stream?${params.toString()}`
+}
+
 /** Resolve metadados JSON (fallback YouTube / embeds). */
 app.get('/api/stream/resolve', async (req, res) => {
   try {
-    const query = req.query.query
-    if (!query || typeof query !== 'string' || !query.trim()) {
-      res.status(400).json({ error: 'Parâmetro query é obrigatório' })
+    const input = readStreamQueryInput(req)
+    if (!input) {
+      res.status(400).json({
+        error: 'Informe query ou title (+ artist opcional)',
+      })
       return
     }
 
     const quality = parseStreamQuality(req.query.quality)
-    const resolved = await resolveYoutubeResult(query)
+    const resolved = await resolveStreamResult(input)
     if (!resolved) {
       res.status(404).json({ error: 'Vídeo não encontrado' })
       return
@@ -669,8 +1085,11 @@ app.get('/api/stream/resolve', async (req, res) => {
     res.json({
       videoId: resolved.videoId,
       title: resolved.title,
+      duration: resolved.duration,
+      source: resolved.source,
+      score: resolved.score,
       quality,
-      streamUrl: `/api/stream?query=${encodeURIComponent(query.trim())}&quality=${quality}`,
+      streamUrl: buildStreamProxyPath(input, quality),
     })
   } catch (error) {
     console.error('Erro ao resolver stream:', error)
@@ -682,7 +1101,8 @@ app.get('/api/stream/resolve', async (req, res) => {
 
 /**
  * Proxy de áudio com CORS liberado para Web Audio API.
- * quality: low | medium | high | ultra → prioriza menor/maior bitrate (yt-dlp).
+ * Aceita query + title/artist/duration para casamento multi-candidato.
+ * quality: low | normal | medium | high | ultra | hifi → bitrate via yt-dlp.
  * ?resolve=1 mantém compatibilidade com clientes que esperam JSON { videoId }.
  */
 async function handleStreamRequest(
@@ -690,10 +1110,11 @@ async function handleStreamRequest(
   res: express.Response,
 ) {
   try {
-    const query = req.query.query
-
-    if (!query || typeof query !== 'string' || !query.trim()) {
-      res.status(400).json({ error: 'Parâmetro query é obrigatório' })
+    const input = readStreamQueryInput(req)
+    if (!input) {
+      res.status(400).json({
+        error: 'Informe query ou title (+ artist opcional)',
+      })
       return
     }
 
@@ -705,7 +1126,7 @@ async function handleStreamRequest(
         req.headers.accept.includes('application/json') &&
         !req.headers.accept.includes('audio/'))
 
-    const resolved = await resolveYoutubeResult(query)
+    const resolved = await resolveStreamResult(input)
     if (!resolved) {
       res.status(404).json({ error: 'Vídeo não encontrado' })
       return
@@ -716,8 +1137,11 @@ async function handleStreamRequest(
       res.json({
         videoId: resolved.videoId,
         title: resolved.title,
+        duration: resolved.duration,
+        source: resolved.source,
+        score: resolved.score,
         quality,
-        streamUrl: `/api/stream?query=${encodeURIComponent(query.trim())}&quality=${quality}`,
+        streamUrl: buildStreamProxyPath(input, quality),
       })
       return
     }
@@ -1113,7 +1537,8 @@ const lyricsMemoryCache = new Map<
   { at: number; payload: LyricsAggregateResult }
 >()
 const LYRICS_CACHE_TTL_MS = 1000 * 60 * 45
-const LYRICS_MEMORY_CACHE_VERSION = 'v2'
+/** v4 — descarta caches com traduções intercaladas / match frouxo. */
+const LYRICS_MEMORY_CACHE_VERSION = 'v4'
 
 // Descarta entradas antigas em memória ao recarregar o servidor
 lyricsMemoryCache.clear()
@@ -1153,21 +1578,59 @@ function setCachedLyrics(
   })
 }
 
-/** Só aceita resultados com artista compatível, duração próxima e texto limpo. */
+/** Só aceita resultados com match rigoroso título+artista, duração próxima e texto limpo. */
 function gateLyricsResult(
   result: LyricsAggregateResult | null,
   options: {
     expectedArtist: string
+    expectedTitle?: string | null
     candidateArtist?: string | null
+    candidateTitle?: string | null
     candidateDuration?: number | null
     targetDuration?: number | null
     requireArtist?: boolean
+    requireStrictTitle?: boolean
   },
 ): LyricsAggregateResult | null {
   if (!result) return null
 
   const requireArtist = options.requireArtist !== false
-  if (requireArtist && options.expectedArtist.trim()) {
+  const requireStrictTitle = options.requireStrictTitle !== false
+
+  if (
+    options.candidateTitle &&
+    isTranslationMetadata(
+      options.candidateTitle,
+      options.expectedTitle ?? undefined,
+    )
+  ) {
+    return null
+  }
+  if (
+    options.candidateArtist &&
+    isTranslationMetadata(
+      options.candidateArtist,
+      options.expectedTitle ?? undefined,
+    )
+  ) {
+    return null
+  }
+
+  if (requireStrictTitle && options.expectedTitle?.trim()) {
+    if (!options.candidateTitle?.trim() || !options.candidateArtist?.trim()) {
+      return null
+    }
+    if (
+      !isStrictTrackMatch(
+        options.expectedTitle,
+        options.expectedArtist,
+        options.candidateTitle,
+        options.candidateArtist,
+      )
+    ) {
+      return null
+    }
+  } else if (requireArtist && options.expectedArtist.trim()) {
     if (!options.candidateArtist?.trim()) return null
     if (!isArtistMatch(options.expectedArtist, options.candidateArtist)) {
       return null
@@ -1323,6 +1786,10 @@ async function fetchLrclibExact(
       if (!res.ok) continue
 
       const data = (await res.json()) as LrclibHit
+      const hitTitle = data.trackName || data.name || title
+      const hitArtist = data.artistName || artist
+      if (!isStrictTrackMatch(title, artist, hitTitle, hitArtist)) continue
+
       if (data.syncedLyrics?.trim()) {
         return {
           syncedLyrics: data.syncedLyrics.trim(),
@@ -1427,12 +1894,18 @@ async function fetchLrclibFuzzy(
           variants[0]
         if (!variant?.artist) continue
 
+        const hitTitle = hit.trackName || hit.name || ''
         const hitArtist = hit.artistName || ''
-        if (!isArtistMatch(expectedArtist || variant.artist, hitArtist)) continue
-
-        const titleOk =
-          tokenSimilarity(hit.trackName || hit.name || '', variant.title) >= 0.4
-        if (!titleOk) continue
+        if (
+          !isStrictTrackMatch(
+            variant.title,
+            expectedArtist || variant.artist,
+            hitTitle,
+            hitArtist,
+          )
+        ) {
+          continue
+        }
         if (!durationClose(hit.duration, durationSec, 15)) continue
 
         const score = scoreLrclibHit(hit, variant, durationSec)
@@ -1443,11 +1916,16 @@ async function fetchLrclibFuzzy(
     }
   }
 
-  if (!best || best.score < 0.45) return null
+  if (!best || best.score < 0.7) return null
+
+  const expectedTitle =
+    variants.find((v) => v.artist)?.title || variants[0]?.title || ''
 
   return gateLyricsResult(lrclibHitToResult(best.hit), {
     expectedArtist,
+    expectedTitle,
     candidateArtist: best.hit.artistName,
+    candidateTitle: best.hit.trackName || best.hit.name,
     candidateDuration: best.hit.duration,
     targetDuration: durationSec,
   })
@@ -1513,7 +1991,7 @@ async function searchGeniusHits(q: string): Promise<GeniusHit[]> {
   return hits
 }
 
-/** Camada 3 — Genius search + scrape (exige artista compatível). */
+/** Camada 3 — Genius search + scrape (anti-tradução + match rigoroso). */
 async function fetchFromGenius(
   variants: LyricsSearchVariant[],
   expectedArtist: string,
@@ -1534,11 +2012,29 @@ async function fetchFromGenius(
         if (hit.type && hit.type !== 'song') continue
 
         const hitTitle = result?.title || result?.full_title || ''
+        const hitFullTitle = result?.full_title || hitTitle
         const hitArtist = result?.primary_artist?.name || ''
-        if (!isArtistMatch(expectedArtist || variant.artist, hitArtist)) continue
 
-        const titleOk = tokenSimilarity(hitTitle, variant.title) >= 0.35
-        if (!titleOk) continue
+        // Bloqueia páginas de tradução / adaptação (Genius Japanese Translations etc.)
+        if (
+          isTranslationMetadata(hitTitle, variant.title) ||
+          isTranslationMetadata(hitFullTitle, variant.title) ||
+          isTranslationMetadata(hitArtist, variant.title) ||
+          isTranslationMetadata(url, variant.title)
+        ) {
+          continue
+        }
+
+        if (
+          !isStrictTrackMatch(
+            variant.title,
+            expectedArtist || variant.artist,
+            hitTitle,
+            hitArtist,
+          )
+        ) {
+          continue
+        }
 
         triedUrls.add(url)
         const plain = await scrapeGeniusLyrics(url)
@@ -1553,7 +2049,9 @@ async function fetchFromGenius(
           },
           {
             expectedArtist,
+            expectedTitle: variant.title,
             candidateArtist: hitArtist,
+            candidateTitle: hitTitle,
           },
         )
       }
@@ -1592,7 +2090,9 @@ async function fetchFromLyricsOvh(
         },
         {
           expectedArtist,
+          expectedTitle: variant.title,
           candidateArtist: variant.artist,
+          candidateTitle: variant.title,
         },
       )
     } catch (error) {
@@ -1607,6 +2107,7 @@ type SoundCloudTrackHit = {
   description?: string | null
   user?: { username?: string }
   permalink_url?: string
+  duration?: number
 }
 
 /** Extra — description SoundCloud (só com artista compatível + texto limpo). */
@@ -1630,7 +2131,15 @@ async function fetchFromSoundCloudDescription(
           }
           for (const track of data.collection ?? []) {
             const trackArtist = track.user?.username || ''
-            if (!isArtistMatch(expectedArtist || variant.artist, trackArtist)) {
+            const trackTitle = track.title || ''
+            if (
+              !isStrictTrackMatch(
+                variant.title,
+                expectedArtist || variant.artist,
+                trackTitle,
+                trackArtist,
+              )
+            ) {
               continue
             }
 
@@ -1649,7 +2158,9 @@ async function fetchFromSoundCloudDescription(
                 },
                 {
                   expectedArtist,
+                  expectedTitle: variant.title,
                   candidateArtist: trackArtist,
+                  candidateTitle: trackTitle,
                 },
               )
             }
@@ -1684,7 +2195,7 @@ async function aggregateLyrics(
   const expectedArtist = cleanLyricsArtist(artist) || variants[0].artist
   const primary = variants[0]
 
-  // Camada 1 — LRCLIB exato
+  // Camada 1 — LRCLIB exato (já valida isStrictTrackMatch internamente)
   if (primary?.artist) {
     const exact = await fetchLrclibExact(
       primary.title,
@@ -1693,7 +2204,9 @@ async function aggregateLyrics(
     )
     const gatedExact = gateLyricsResult(exact, {
       expectedArtist,
+      expectedTitle: primary.title,
       candidateArtist: primary.artist,
+      candidateTitle: primary.title,
       targetDuration: durationSec,
       requireArtist: true,
     })
@@ -1703,14 +2216,14 @@ async function aggregateLyrics(
     }
   }
 
-  // Camada 2 — LRCLIB fuzzy
+  // Camada 2 — LRCLIB fuzzy (score ≥0.7 + strict title)
   const fuzzy = await fetchLrclibFuzzy(variants, expectedArtist, durationSec)
   if (fuzzy) {
     setCachedLyrics(title, artist, durationSec, fuzzy)
     return fuzzy
   }
 
-  // Camada 3 — Genius
+  // Camada 3 — Genius (anti-tradução + strict)
   const genius = await fetchFromGenius(variants, expectedArtist)
   if (genius) {
     setCachedLyrics(title, artist, durationSec, genius)
@@ -1731,7 +2244,8 @@ async function aggregateLyrics(
     return sc
   }
 
-  return null
+  // Nenhum candidato passou na validação rigorosa — não arriscar letra errada
+  return { syncedLyrics: null, plainLyrics: null, source: '', found: false }
 }
 
 async function collectLyricsCandidates(q: string): Promise<LyricsCandidate[]> {
@@ -1776,10 +2290,22 @@ async function collectLyricsCandidates(q: string): Promise<LyricsCandidate[]> {
     for (const hit of hits.slice(0, 6)) {
       const result = hit.result
       if (!result?.url || hit.type === 'artist') continue
+      const candTitle = result.title || result.full_title || 'Sem título'
+      const candArtist =
+        result.primary_artist?.name || 'Artista desconhecido'
+      const fullTitle = result.full_title || candTitle
+      if (
+        isTranslationMetadata(candTitle) ||
+        isTranslationMetadata(fullTitle) ||
+        isTranslationMetadata(candArtist) ||
+        isTranslationMetadata(result.url)
+      ) {
+        continue
+      }
       push({
         id: String(result.id ?? result.url),
-        title: result.title || result.full_title || 'Sem título',
-        artist: result.primary_artist?.name || 'Artista desconhecido',
+        title: candTitle,
+        artist: candArtist,
         duration: null,
         hasSynced: false,
         source: 'genius',
@@ -1957,6 +2483,18 @@ app.get('/api/lyrics/candidate', async (req, res) => {
 /** Alinhamento áudio↔letra via Gemini 2.5 Flash (fallback seguro se sem API key). */
 app.post('/api/lyrics/ai-sync', (req, res) => {
   void handleAiLyricsSync(req, res)
+})
+
+// Blindagem: falhas de stream/extração não derrubam a porta 3001
+process.on('uncaughtException', (error) => {
+  console.error('[server] uncaughtException (servidor permanece ativo):', error)
+})
+
+process.on('unhandledRejection', (reason) => {
+  console.error(
+    '[server] unhandledRejection (servidor permanece ativo):',
+    reason,
+  )
 })
 
 app.listen(PORT, () => {

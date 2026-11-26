@@ -17,7 +17,7 @@ import {
   type PersonalizedMix,
   type SuggestedArtist,
 } from '../services/recommendationService'
-import type { SpotifyTrack } from '../services/spotify'
+import { isSpotifyInCooldown, type SpotifyTrack } from '../services/spotify'
 import {
   PROFILE_UPDATED_EVENT,
   getUserProfile,
@@ -92,16 +92,21 @@ export function Home() {
 
     async function run() {
       try {
+        const spotifyBlocked = isSpotifyInCooldown()
+
         if (reloadToken > 0) {
           setIsRefreshing(true)
-          clearHomeRecommendationsCache()
+          // Em cooldown, não limpa cache nem força novas buscas Spotify
+          if (!spotifyBlocked) {
+            clearHomeRecommendationsCache()
+          }
         } else {
           setIsLoading(true)
         }
         setError(null)
 
         const data = await getPersonalizedHomeData({
-          forceRefresh: reloadToken > 0,
+          forceRefresh: reloadToken > 0 && !spotifyBlocked,
         })
 
         if (cancelled) return

@@ -67,14 +67,15 @@ function customLrcKey(trackId: string) {
 }
 
 function lyricsCacheKey(trackId: string) {
-  return `azuri_lyrics_v3_${trackId}`
+  return `azuri_lyrics_v4_${trackId}`
 }
 
-/** Remove caches legados (inclui letras erradas da v1/v2 com bloco Order:). */
+/** Remove caches legados (traduções intercaladas / match frouxo v1–v3). */
 function clearLegacyLyricsCache(trackId: string) {
   try {
     localStorage.removeItem(`azuri_lyrics_cache_${trackId}`)
     localStorage.removeItem(`azuri_lyrics_v2_${trackId}`)
+    localStorage.removeItem(`azuri_lyrics_v3_${trackId}`)
     localStorage.removeItem(`azuri_lyrics_${trackId}`)
   } catch {
     /* ignore */
@@ -862,7 +863,7 @@ export function writeLyricsTiming(
   }
 }
 
-/** Limpa cache de letras (v2 + legado) para rebuscar/recalcular. */
+/** Limpa cache de letras (v4 + legado) para rebuscar/recalcular. */
 export function clearLyricsCache(trackId: string) {
   try {
     localStorage.removeItem(lyricsCacheKey(trackId))
@@ -1006,7 +1007,10 @@ export async function fetchLyrics(input: {
   artistName: string
   albumName?: string
   durationMs?: number
+  signal?: AbortSignal
 }): Promise<LyricsResult | null> {
+  clearLegacyLyricsCache(input.trackId)
+
   const durationSec =
     input.durationMs != null && input.durationMs > 0
       ? input.durationMs / 1000
@@ -1018,7 +1022,7 @@ export async function fetchLyrics(input: {
   const custom = getCustomLyrics(input.trackId, durationSec)
   if (custom) return custom
 
-  // Cache local — abertura instantânea sem nova rede
+  // Cache local v4 — abertura instantânea sem nova rede
   const cached = readLyricsCache(input.trackId)
   if (cached) {
     const fromCache = payloadToResult(cached, durationSec)
@@ -1038,12 +1042,17 @@ export async function fetchLyrics(input: {
       params.set('duration', String(Math.round(durationSec)))
     }
 
-    const res = await fetch(`${LYRICS_API}?${params.toString()}`)
+    const res = await fetch(`${LYRICS_API}?${params.toString()}`, {
+      signal: input.signal,
+    })
     if (!res.ok) return null
 
     const data = (await res.json()) as BackendLyricsPayload
+    if (input.signal?.aborted) return null
+    if (data.found === false) return null
     return persistAndConvert(input.trackId, data, durationSec)
-  } catch {
+  } catch (error) {
+    if ((error as { name?: string })?.name === 'AbortError') return null
     return null
   }
 }
@@ -1144,9 +1153,15 @@ export function getPlainLyricLines(result: LyricsResult): string[] {
     .filter(Boolean)
 }
 
+export type GeminiSyncOutcome =
+  | { status: 'ok'; lyrics: LyricsResult }
+  | { status: 'mismatch'; reason?: string }
+  | { status: 'failed'; reason?: string }
+  | { status: 'aborted' }
+
 /**
  * Alinha a letra ao áudio real via Gemini (POST /api/lyrics/ai-sync).
- * Persiste em azuri_lyrics_v3_* com isAiSynced: true e zera offset local.
+ * Persiste em azuri_lyrics_v4_* com isAiSynced: true e zera offset local.
  * audioUrl pode ser vazio — o backend resolve o stream por title+artist.
  */
 export async function syncLyricsWithGemini(
@@ -1160,10 +1175,12 @@ export async function syncLyricsWithGemini(
   },
   plainLines: string[],
   currentAudioSrc: string | null | undefined,
-  options?: { durationSec?: number; force?: boolean },
-): Promise<LyricsResult | null> {
+  options?: { durationSec?: number; force?: boolean; signal?: AbortSignal },
+): Promise<GeminiSyncOutcome> {
   const lines = plainLines.map((line) => line.trim()).filter(Boolean)
-  if (!track.id || lines.length === 0) return null
+  if (!track.id || lines.length === 0) {
+    return { status: 'failed', reason: 'Sem versos para alinhar' }
+  }
 
   const audioUrl = (
     currentAudioSrc?.trim() ||
@@ -1187,6 +1204,7 @@ export async function syncLyricsWithGemini(
     const res = await fetch(LYRICS_AI_SYNC_API, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
+      signal: options?.signal,
       body: JSON.stringify({
         title: cleanTrackTitle(track.name) || track.name,
         artist,
@@ -1199,16 +1217,29 @@ export async function syncLyricsWithGemini(
       }),
     })
 
-    if (!res.ok) return null
+    if (options?.signal?.aborted) return { status: 'aborted' }
+    if (!res.ok) return { status: 'failed' }
 
     const data = (await res.json()) as {
       syncedLines?: LyricLine[]
       source?: string
       fallback?: boolean
       reason?: string
+      matchesAudio?: boolean
     }
 
-    if (data.fallback || !data.syncedLines?.length) return null
+    if (data.matchesAudio === false) {
+      return {
+        status: 'mismatch',
+        reason:
+          data.reason ||
+          'A letra encontrada não corresponde ao áudio da faixa.',
+      }
+    }
+
+    if (data.fallback || !data.syncedLines?.length) {
+      return { status: 'failed', reason: data.reason }
+    }
 
     const syncedLines = data.syncedLines
       .map((line) => ({
@@ -1217,7 +1248,9 @@ export async function syncLyricsWithGemini(
       }))
       .filter((line) => line.text && Number.isFinite(line.time) && line.time >= 0)
 
-    if (syncedLines.length === 0) return null
+    if (syncedLines.length === 0) {
+      return { status: 'failed', reason: 'Alignments vazios' }
+    }
 
     // Preservar ordem original dos versos (já alinhados 1-para-1 no server)
     const plainText = lines.join('\n')
@@ -1234,16 +1267,33 @@ export async function syncLyricsWithGemini(
     writeLyricsTiming(track.id, { offsetSeconds: 0 })
 
     return {
-      lines: syncedLines,
-      synced: true,
-      isEstimated: false,
-      isAiSynced: true,
-      plainText,
-      source,
+      status: 'ok',
+      lyrics: {
+        lines: syncedLines,
+        synced: true,
+        isEstimated: false,
+        isAiSynced: true,
+        plainText,
+        source,
+      },
     }
   } catch (error) {
+    if ((error as { name?: string })?.name === 'AbortError') {
+      return { status: 'aborted' }
+    }
     console.error('syncLyricsWithGemini falhou:', error)
-    return null
+    const message =
+      error instanceof Error ? error.message : String(error ?? '')
+    // Propaga falha de rede para a UI resetar o botão e avisar servidor offline
+    if (
+      error instanceof TypeError ||
+      /failed to fetch|networkerror|load failed|err_connection/i.test(message)
+    ) {
+      throw error instanceof Error
+        ? error
+        : new TypeError('Failed to fetch')
+    }
+    return { status: 'failed' }
   }
 }
 

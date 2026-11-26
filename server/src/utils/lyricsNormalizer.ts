@@ -183,6 +183,106 @@ export function isArtistMatch(
 }
 
 /**
+ * Normalização estrita de título para match de letras:
+ * remove só tags técnicas (Official Audio, Visualizer, prod…);
+ * mantém Pt. 2, Remix, anos e números relevantes.
+ */
+export function normalizeStrictTitle(raw: string): string {
+  return raw
+    .normalize('NFD')
+    .replace(/\p{M}/gu, '')
+    .toLowerCase()
+    .replace(
+      /\s*[([{]?\s*(feat\.?|ft\.?|featuring|prod\.?|produced by|prod by)\s+[^)\]}]*[)\]}]?/gi,
+      ' ',
+    )
+    .replace(
+      /\s*[([{][^)\]}]*(official(?:\s+(?:audio|video|music\s*video|lyric\s*video))?|lyrics?|audio|visuali[sz]er|topic|hd|4k|mv|explicit|clean|remaster(?:ed)?)[^)\]}]*[)\]}]/gi,
+      ' ',
+    )
+    .replace(
+      /\s*[-–—]\s*(official(?:\s+\w+)?|lyric(?:s)?|audio|video|visuali[sz]er).*$/i,
+      '',
+    )
+    .replace(/[^\p{L}\p{N}\s'.&+-]/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+const TRANSLATION_META_TERMS = [
+  'translations',
+  'traduções',
+  'traducciones',
+  'traductions',
+  'übersetzungen',
+  'ubersetzungen',
+  'tradução',
+  'traducao',
+  '日本語訳',
+  '한국어',
+  'romanized',
+  'romanização',
+  'romanizacao',
+  'translated',
+  'genius brasil',
+  'genius japanese',
+  'genius korea',
+  'genius translations',
+] as const
+
+/**
+ * Detecta páginas/metadados de tradução Genius (e similares).
+ * Só rejeita se o termo NÃO fizer parte do título original esperado.
+ */
+export function isTranslationMetadata(
+  text: string,
+  expectedTitle?: string,
+): boolean {
+  const hay = text
+    .normalize('NFD')
+    .replace(/\p{M}/gu, '')
+    .toLowerCase()
+  if (!hay) return false
+
+  const expected = (expectedTitle ?? '')
+    .normalize('NFD')
+    .replace(/\p{M}/gu, '')
+    .toLowerCase()
+
+  for (const term of TRANSLATION_META_TERMS) {
+    if (hay.includes(term) && !expected.includes(term)) return true
+  }
+  return false
+}
+
+/**
+ * Match rigoroso título (≥85% tokens ou exato) + artista principal confirmado.
+ * Impede puxar outra faixa parecida do mesmo artista ou página de tradução.
+ */
+export function isStrictTrackMatch(
+  expectedTitle: string,
+  expectedArtist: string,
+  candidateTitle: string,
+  candidateArtist: string,
+): boolean {
+  if (!expectedTitle?.trim() || !candidateTitle?.trim()) return false
+  if (!isArtistMatch(expectedArtist, candidateArtist)) return false
+
+  if (
+    isTranslationMetadata(candidateTitle, expectedTitle) ||
+    isTranslationMetadata(candidateArtist, expectedTitle)
+  ) {
+    return false
+  }
+
+  const expected = normalizeStrictTitle(expectedTitle)
+  const candidate = normalizeStrictTitle(candidateTitle)
+  if (!expected || !candidate) return false
+  if (expected === candidate) return true
+  return tokenSimilarity(expected, candidate) >= 0.85
+}
+
+/**
  * Rejeita press-releases, links comerciais e tracklists de vinil/álbum.
  */
 export function isValidLyricsText(text: string): boolean {

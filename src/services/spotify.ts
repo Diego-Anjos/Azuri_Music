@@ -135,7 +135,13 @@ const TOKEN_STORAGE_KEY = 'azuri_spotify_token'
 const SEARCH_CACHE_TTL_MS = 10 * 60 * 1000
 const SEARCH_TRACKS_CACHE_PREFIX = 'azuri_sp_tracks:'
 const SEARCH_CATALOG_CACHE_PREFIX = 'azuri_sp_catalog:'
+const ARTIST_PROFILE_CACHE_PREFIX = 'azuri_artist_profile_'
+const ARTIST_PROFILE_CACHE_TTL_MS = 24 * 60 * 60 * 1000
 const SPOTIFY_COOLDOWN_MS = 45_000
+/** Teto máximo do circuit breaker 429 (evita Retry-After de dezenas de minutos). */
+const SPOTIFY_COOLDOWN_MAX_MS = 60_000
+const BACKEND_SEARCH_URL = 'http://localhost:3001/api/search'
+const LISTENING_HISTORY_KEY = 'azuri_listening_history'
 
 /** Token único em memória (espelhado em sessionStorage). */
 let cachedAccessToken: string | null = null
@@ -149,14 +155,20 @@ export function isSpotifyCoolingDown(): boolean {
   return Date.now() < spotifyCooldownUntil
 }
 
+/** Alias explícito usado pela Home / Artist / recomendações. */
+export function isSpotifyInCooldown(): boolean {
+  return isSpotifyCoolingDown()
+}
+
 function tripSpotifyCooldown(retryAfterHeader?: string | null) {
-  let pauseMs = SPOTIFY_COOLDOWN_MS
+  let retryAfterMs = SPOTIFY_COOLDOWN_MS
   if (retryAfterHeader) {
     const seconds = Number(retryAfterHeader)
     if (Number.isFinite(seconds) && seconds > 0) {
-      pauseMs = Math.max(pauseMs, Math.round(seconds * 1000))
+      retryAfterMs = Math.round(seconds * 1000)
     }
   }
+  const pauseMs = Math.min(retryAfterMs, SPOTIFY_COOLDOWN_MAX_MS)
   spotifyCooldownUntil = Date.now() + pauseMs
   console.warn(
     `Spotify 429 — cooldown até ${new Date(spotifyCooldownUntil).toISOString()}`,
@@ -682,7 +694,7 @@ async function fetchSpotifyArtistAlbums(
   // 1) Discografia oficial quando o ID Spotify é válido
   try {
     const res = await spotifyApiFetch(
-      `https://api.spotify.com/v1/artists/${artistId}/albums?include_groups=album,single&limit=50&market=US`,
+      `https://api.spotify.com/v1/artists/${artistId}/albums?include_groups=album,single&limit=10&market=US`,
       { headers },
     )
     if (res?.ok) {
@@ -738,6 +750,29 @@ export async function getAllArtistTracks(
   }
 
   try {
+    // Em cooldown: só SoundCloud / fontes locais — não chama getAccessToken()
+    if (isSpotifyInCooldown()) {
+      const soundcloud = await fetchSoundCloudArtistTracks(name)
+      const avatarFallback = options?.artistImageUrl?.trim() || null
+      const soundcloudTracks: ArtistProfileTrack[] = soundcloud.tracks.map(
+        (track) => {
+          const hasCover = Boolean(track.album?.images?.[0]?.url)
+          if (hasCover || !avatarFallback) return track
+          return {
+            ...track,
+            album: {
+              name: track.album?.name ?? track.name,
+              images: [{ url: avatarFallback }],
+            },
+          }
+        },
+      )
+      const localTracks = await collectLocalArtistTracks(artistId, name)
+      const unified = mergeTracksByNormalizedTitle(localTracks, soundcloudTracks)
+      const total = Math.max(unified.length, soundcloud.total)
+      return { tracks: unified, total, soundcloudTotal: soundcloud.total }
+    }
+
     const token = await getAccessToken()
     const filterQuery = `artist:"${name}"`
 
@@ -1028,6 +1063,8 @@ export interface ArtistProfile {
   location: string | null
   description: string | null
   soundcloudUrl: string | null
+  /** Perfil montado sem Spotify (cache local / multi-fonte) durante cooldown. */
+  isFallback?: boolean
 }
 
 interface ArtistMetaResponse {
@@ -1157,6 +1194,7 @@ function buildArtistProfile(
   topTracks: ArtistProfileTrack[],
   albums: ArtistProfileAlbum[],
   meta: ArtistMetaResponse | null = null,
+  options?: { isFallback?: boolean },
 ): ArtistProfile {
   const followers =
     artist.followers?.total || meta?.followersCount || 0
@@ -1182,6 +1220,414 @@ function buildArtistProfile(
     location: meta?.location ?? null,
     description: meta?.description ?? null,
     soundcloudUrl: meta?.permalinkUrl ?? null,
+    isFallback: options?.isFallback === true ? true : undefined,
+  }
+}
+
+function artistProfileStorageKey(key: string): string {
+  return `${ARTIST_PROFILE_CACHE_PREFIX}${normalizeQueryKey(key)}`
+}
+
+function readArtistProfileCache(keys: Array<string | undefined | null>): ArtistProfile | null {
+  for (const key of keys) {
+    if (!key?.trim()) continue
+    try {
+      const raw = localStorage.getItem(artistProfileStorageKey(key))
+      if (!raw) continue
+      const parsed = JSON.parse(raw) as TimedCachePayload<ArtistProfile>
+      if (!parsed?.data || typeof parsed.savedAt !== 'number') continue
+      if (Date.now() - parsed.savedAt > ARTIST_PROFILE_CACHE_TTL_MS) {
+        localStorage.removeItem(artistProfileStorageKey(key))
+        continue
+      }
+      return parsed.data
+    } catch {
+      // ignore corrupt entry
+    }
+  }
+  return null
+}
+
+function writeArtistProfileCache(profile: ArtistProfile) {
+  const keys = [profile.id, profile.name]
+    .map((key) => key?.trim())
+    .filter((key): key is string => Boolean(key))
+
+  const unique = [...new Set(keys.map((key) => normalizeQueryKey(key)))]
+  const payload: TimedCachePayload<ArtistProfile> = {
+    savedAt: Date.now(),
+    data: { ...profile, isFallback: undefined },
+  }
+
+  for (const key of unique) {
+    try {
+      localStorage.setItem(
+        `${ARTIST_PROFILE_CACHE_PREFIX}${key}`,
+        JSON.stringify(payload),
+      )
+    } catch {
+      // ignore quota / private mode
+    }
+  }
+}
+
+function libraryTrackToArtistTrack(track: {
+  id: string
+  name: string
+  artists?: Array<{ id?: string; name: string }>
+  album?: ArtistProfileTrack['album']
+  duration_ms?: number
+}): ArtistProfileTrack {
+  return {
+    id: track.id,
+    name: track.name,
+    artists: (track.artists ?? []).map((artist) => ({
+      id: artist.id,
+      name: artist.name,
+    })),
+    album: track.album ?? null,
+    duration_ms: track.duration_ms,
+  }
+}
+
+function pickBestCoverUrl(tracks: ArtistProfileTrack[]): string | null {
+  let best: string | null = null
+  let bestScore = -1
+
+  for (const track of tracks) {
+    const images = track.album?.images ?? []
+    for (const image of images) {
+      const url = image?.url?.trim()
+      if (!url || !/^https?:\/\//i.test(url)) continue
+      // Heurística: URLs maiores / sem miniaturas explícitas pontuam mais
+      let score = url.length
+      if (/640|600|500|480|300x300|300x/i.test(url)) score += 400
+      if (/100x100|64x64|60x60|small/i.test(url)) score -= 200
+      if (score > bestScore) {
+        bestScore = score
+        best = url
+      }
+    }
+  }
+
+  return best
+}
+
+async function fetchBackendArtistTracks(
+  artistName: string,
+): Promise<ArtistProfileTrack[]> {
+  if (!artistName.trim()) return []
+
+  try {
+    const response = await fetch(
+      `${BACKEND_SEARCH_URL}?q=${encodeURIComponent(artistName.trim())}`,
+    )
+    if (!response.ok) return []
+
+    const data = (await response.json()) as {
+      tracks?: Array<{
+        id?: string
+        name?: string
+        artistName?: string
+        albumCoverUrl?: string
+        albumName?: string
+        albumReleaseDate?: string
+        durationMs?: number
+        artists?: Array<{ id?: string; name?: string }>
+      } | null>
+    }
+
+    return (data.tracks ?? [])
+      .filter(
+        (item): item is NonNullable<typeof item> =>
+          item != null && Boolean(item.id) && Boolean(item.name),
+      )
+      .map((item) => {
+        const artists =
+          item.artists && item.artists.length > 0
+            ? item.artists
+                .filter((a) => Boolean(a.name))
+                .map((a) => ({ id: a.id, name: a.name! }))
+            : [
+                {
+                  id: undefined,
+                  name: item.artistName || artistName,
+                },
+              ]
+
+        return {
+          id: String(item.id),
+          name: item.name!,
+          artists,
+          album: {
+            name: item.albumName,
+            release_date: item.albumReleaseDate,
+            images: item.albumCoverUrl ? [{ url: item.albumCoverUrl }] : null,
+          },
+          duration_ms: item.durationMs,
+        } satisfies ArtistProfileTrack
+      })
+  } catch (error) {
+    console.warn('Fallback /api/search indisponível no perfil:', error)
+    return []
+  }
+}
+
+async function collectLocalArtistTracks(
+  artistId: string,
+  artistName: string,
+): Promise<ArtistProfileTrack[]> {
+  const exactId = artistId.trim()
+  const nameLower = artistName.trim().toLowerCase()
+  const matches = (artists: Array<{ id?: string; name?: string }> | undefined) =>
+    trackMatchesArtist(artists, exactId, artistName) ||
+    (artists ?? []).some((a) => a.name?.toLowerCase().includes(nameLower))
+
+  const byId = new Map<string, ArtistProfileTrack>()
+
+  const push = (track: ArtistProfileTrack | null | undefined) => {
+    if (!track?.id || !track.name) return
+    if (!matches(track.artists)) return
+    if (byId.has(track.id)) return
+    byId.set(track.id, track)
+  }
+
+  try {
+    const { getLikedTracks, getPlaylists, getRecentPlays } =
+      await import('./libraryStorage')
+
+    for (const liked of getLikedTracks()) {
+      push(libraryTrackToArtistTrack(liked))
+    }
+
+    for (const playlist of getPlaylists()) {
+      for (const track of playlist.tracks) {
+        push(libraryTrackToArtistTrack(track))
+      }
+    }
+
+    for (const recent of getRecentPlays(40)) {
+      if (recent.kind !== 'track') continue
+      push(
+        libraryTrackToArtistTrack({
+          id: recent.id,
+          name: recent.name,
+          artists: recent.artists,
+          album: recent.album ?? {
+            name: recent.name,
+            images: recent.imageUrl ? [{ url: recent.imageUrl }] : null,
+          },
+          duration_ms: recent.duration_ms,
+        }),
+      )
+    }
+  } catch {
+    // ignore library failures
+  }
+
+  try {
+    const raw = localStorage.getItem(LISTENING_HISTORY_KEY)
+    if (raw) {
+      const parsed = JSON.parse(raw) as Array<{
+        trackId?: string
+        name?: string
+        artistId?: string
+        artistName?: string
+        albumCoverUrl?: string
+      }>
+      if (Array.isArray(parsed)) {
+        for (const entry of parsed) {
+          if (!entry?.trackId || !entry.name) continue
+          push({
+            id: entry.trackId,
+            name: entry.name,
+            artists: [
+              {
+                id: entry.artistId,
+                name: entry.artistName || artistName,
+              },
+            ],
+            album: {
+              images: entry.albumCoverUrl
+                ? [{ url: entry.albumCoverUrl }]
+                : null,
+            },
+          })
+        }
+      }
+    }
+  } catch {
+    // ignore
+  }
+
+  try {
+    const { getUserReleases } = await import('./creatorService')
+    for (const release of getUserReleases()) {
+      if (
+        release.artistName.trim().toLowerCase() !== nameLower &&
+        !release.artistName.toLowerCase().includes(nameLower)
+      ) {
+        continue
+      }
+      for (const track of release.tracks) {
+        push({
+          id: track.id,
+          name: track.title,
+          artists: [{ id: exactId || undefined, name: release.artistName }],
+          album: {
+            id: release.id,
+            name: release.title,
+            release_date: release.releaseDate,
+            images: release.coverUrl ? [{ url: release.coverUrl }] : null,
+          },
+          duration_ms: track.durationMs,
+        })
+      }
+    }
+  } catch {
+    // ignore studio catalog
+  }
+
+  try {
+    const { usePlayerStore } = await import('../store/usePlayerStore')
+    const current = usePlayerStore.getState().currentTrack
+    if (current) push(libraryTrackToArtistTrack(current))
+  } catch {
+    // ignore player store
+  }
+
+  return [...byId.values()]
+}
+
+async function resolveLocalArtistName(
+  id: string,
+  artistName?: string,
+): Promise<string> {
+  if (artistName?.trim()) return artistName.trim()
+
+  try {
+    const { getFollowingArtists, getLikedTracks, getRecentPlays, getPlaylists } =
+      await import('./libraryStorage')
+
+    const followed = getFollowingArtists().find((artist) => artist.id === id)
+    if (followed?.name) return followed.name
+
+    for (const liked of getLikedTracks()) {
+      const match = liked.artists?.find((a) => a.id === id)
+      if (match?.name) return match.name
+    }
+
+    for (const recent of getRecentPlays(40)) {
+      if (recent.kind === 'artist' && recent.id === id && recent.name) {
+        return recent.name
+      }
+      if (recent.kind === 'track') {
+        const match = recent.artists?.find((a) => a.id === id)
+        if (match?.name) return match.name
+      }
+    }
+
+    for (const playlist of getPlaylists()) {
+      for (const track of playlist.tracks) {
+        const match = track.artists?.find((a) => a.id === id)
+        if (match?.name) return match.name
+      }
+    }
+  } catch {
+    // ignore
+  }
+
+  try {
+    const raw = localStorage.getItem(LISTENING_HISTORY_KEY)
+    if (raw) {
+      const parsed = JSON.parse(raw) as Array<{
+        artistId?: string
+        artistName?: string
+      }>
+      const hit = parsed.find((entry) => entry.artistId === id)
+      if (hit?.artistName) return hit.artistName
+    }
+  } catch {
+    // ignore
+  }
+
+  return id
+}
+
+async function buildFallbackArtistProfile(
+  id: string,
+  artistName?: string,
+): Promise<ArtistProfile> {
+  const resolvedName = await resolveLocalArtistName(id, artistName)
+  const [localTracks, backendTracks] = await Promise.all([
+    collectLocalArtistTracks(id, resolvedName),
+    fetchBackendArtistTracks(resolvedName),
+  ])
+
+  const byId = new Map<string, ArtistProfileTrack>()
+  for (const track of [...localTracks, ...backendTracks]) {
+    if (!track.id || byId.has(track.id)) continue
+    if (
+      !trackMatchesArtist(track.artists, id, resolvedName) &&
+      !track.artists.some((a) =>
+        a.name?.toLowerCase().includes(resolvedName.toLowerCase()),
+      )
+    ) {
+      // Ainda inclui se veio do backend com o mesmo termo de busca
+      if (!backendTracks.some((b) => b.id === track.id)) continue
+    }
+    byId.set(track.id, track)
+  }
+
+  const topTracks = [...byId.values()]
+  const coverUrl = pickBestCoverUrl(topTracks)
+  const images = coverUrl ? [{ url: coverUrl }] : []
+
+  const albumsMap = new Map<string, ArtistProfileAlbum>()
+  for (const track of topTracks) {
+    const albumName = track.album?.name?.trim()
+    if (!albumName) continue
+    const albumId = track.album?.id || `album-${albumName.toLowerCase()}`
+    if (albumsMap.has(albumId)) continue
+    albumsMap.set(albumId, {
+      id: albumId,
+      name: albumName,
+      year: track.album?.release_date?.slice(0, 4) ?? '—',
+      imageUrl: track.album?.images?.[0]?.url ?? coverUrl ?? '',
+      albumType: 'album',
+    })
+  }
+
+  return {
+    id,
+    name: resolvedName,
+    images,
+    bannerUrl: coverUrl,
+    followers: 0,
+    genres: [],
+    popularity: estimateArtistPopularity(0, topTracks.length, albumsMap.size),
+    topTracks,
+    albums: [...albumsMap.values()],
+    totalTracksCount: topTracks.length,
+    location: null,
+    description: null,
+    soundcloudUrl: null,
+    isFallback: true,
+  }
+}
+
+async function getArtistProfileFromCacheOrFallback(
+  id: string,
+  artistName?: string,
+): Promise<ArtistProfile | null> {
+  const cached = readArtistProfileCache([id, artistName])
+  if (cached) return cached
+
+  try {
+    return await buildFallbackArtistProfile(id, artistName)
+  } catch (error) {
+    console.error('Erro no fallback de perfil do artista:', error)
+    return null
   }
 }
 
@@ -1287,10 +1733,16 @@ export async function getArtistProfile(
   id: string,
   artistName?: string,
 ): Promise<ArtistProfile | null> {
+  if (!id?.trim()) return null
+
+  // Nunca quebrar no cooldown: cache → multi-fonte local/backend
+  if (isSpotifyInCooldown()) {
+    return getArtistProfileFromCacheOrFallback(id, artistName)
+  }
+
   try {
     const token = await getAccessToken()
     const headers = { Authorization: `Bearer ${token}` }
-    let artistId = id
     let artistData: SpotifyArtistApiPayload | null = null
 
     // 1. Tentar buscar pelo ID direto
@@ -1317,12 +1769,14 @@ export async function getArtistProfile(
 
         if (found) {
           artistData = found
-          artistId = found.id
         }
       }
     }
 
-    if (!artistData) throw new Error('Artista não encontrado no Spotify')
+    if (!artistData) {
+      // Spotify sem resultado (ou 429 no meio) → cache / multi-fonte
+      return getArtistProfileFromCacheOrFallback(id, artistName)
+    }
 
     // 3. ESTRATÉGIA DE BUSCA — catalog + artist:"Nome" + discografia
     //    + metadados SoundCloud (banner, seguidores, bio…) via backend Azuri
@@ -1455,16 +1909,18 @@ export async function getArtistProfile(
       }
     }
 
-    // 5. Retornar objeto formatado para a UI
-    return buildArtistProfile(
+    // 5. Retornar objeto formatado para a UI + persistir cache 24h
+    const profile = buildArtistProfile(
       artistData,
       extractTopTracksFromPayload({ tracks: topTracks }),
       mapArtistAlbums(albums),
       artistMeta,
     )
+    writeArtistProfileCache(profile)
+    return profile
   } catch (error) {
     console.error('Erro ao carregar perfil:', error)
-    return null
+    return getArtistProfileFromCacheOrFallback(id, artistName)
   }
 }
 

@@ -64,9 +64,13 @@ export function Artist() {
   const location = useLocation()
   const navigate = useNavigate()
   const playTrack = usePlayerStore((state) => state.playTrack)
-  const artistName =
-    (location.state as ArtistLocationState | null)?.artistName || ''
+  // Nome opcional da navegação — lido via ref (não como dependência do efeito)
+  // para evitar reload quando o state muda sem mudar o id da rota.
   const tracksSectionRef = useRef<HTMLDivElement | null>(null)
+  const requestIdRef = useRef(0)
+  const artistNameHintRef = useRef<string | undefined>(undefined)
+  artistNameHintRef.current =
+    (location.state as ArtistLocationState | null)?.artistName || undefined
 
   const [artist, setArtist] = useState<ArtistProfile | null>(null)
   const [loading, setLoading] = useState(true)
@@ -80,8 +84,12 @@ export function Artist() {
   const [isOfficialBanner, setIsOfficialBanner] = useState(false)
 
   useEffect(() => {
+    if (!id) return
+
+    const requestId = ++requestIdRef.current
+    const artistNameHint = artistNameHintRef.current
+
     async function loadData() {
-      if (!id) return
       setLoading(true)
       setIsBioExpanded(false)
       setBannerSrc(null)
@@ -91,7 +99,9 @@ export function Artist() {
       setShowAllTracks(false)
       setIsLoadingTracks(true)
 
-      const data = await getArtistProfile(id, artistName || undefined)
+      const data = await getArtistProfile(id, artistNameHint)
+      if (requestId !== requestIdRef.current) return
+
       setArtist(data)
 
       if (data) {
@@ -102,10 +112,19 @@ export function Artist() {
         // Mostra topTracks imediatamente enquanto o catálogo completo carrega
         setAllTracks(data.topTracks ?? [])
 
+        // Fallback multi-fonte já traz faixas suficientes — evita novas
+        // chamadas Spotify em cooldown e corridas de estado.
+        if (data.isFallback) {
+          setIsLoadingTracks(false)
+          setLoading(false)
+          return
+        }
+
         try {
           const catalog = await getAllArtistTracks(data.id, data.name, {
             artistImageUrl: data.images?.[0]?.url ?? null,
           })
+          if (requestId !== requestIdRef.current) return
 
           const unified =
             catalog.tracks.length > 0 ? catalog.tracks : data.topTracks ?? []
@@ -125,17 +144,21 @@ export function Artist() {
         } catch (error) {
           console.error('Erro ao carregar catálogo completo:', error)
         } finally {
-          setIsLoadingTracks(false)
+          if (requestId === requestIdRef.current) {
+            setIsLoadingTracks(false)
+          }
         }
-      } else {
+      } else if (requestId === requestIdRef.current) {
         setIsLoadingTracks(false)
       }
 
-      setLoading(false)
+      if (requestId === requestIdRef.current) {
+        setLoading(false)
+      }
     }
 
     void loadData()
-  }, [id, artistName])
+  }, [id])
 
   const avatarUrl = artist?.images?.[0]?.url
   const loadedCount = allTracks.length
@@ -218,6 +241,16 @@ export function Artist() {
 
   return (
     <div className="min-h-0 flex-1 overflow-y-auto bg-[#0B0F19] pb-32">
+      {artist.isFallback && (
+        <div
+          role="status"
+          className="border-b border-amber-500/20 bg-amber-500/10 px-4 py-2 text-center text-xs text-amber-200/90 md:px-8"
+        >
+          Exibindo catálogo local e alternativo enquanto a API do Spotify
+          aguarda liberação
+        </div>
+      )}
+
       {/* 1. BANNER PANORÂMICO (SoundCloud + Spotify + Azuri) */}
       <div className="relative h-72 w-full overflow-hidden bg-[#0B0F19] pt-2 md:h-80 md:pt-4">
         {bannerSrc ? (

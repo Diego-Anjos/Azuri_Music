@@ -1,9 +1,10 @@
 import {
   useEffect,
   useMemo,
+  useRef,
   useState,
   type CSSProperties,
-  type MouseEvent,
+  type PointerEvent as ReactPointerEvent,
 } from 'react'
 import { usePlayerStore } from '../store/usePlayerStore'
 import { generateTrackWaveform } from '../utils/waveformGenerator'
@@ -40,6 +41,10 @@ export function TrackWaveform({
 
   const isCurrent = currentTrack?.id === trackId
   const isActive = isCurrent && isPlaying
+  const canSeek = interactiveSeek && (isCurrent || Boolean(onBarClick))
+
+  const containerRef = useRef<HTMLDivElement>(null)
+  const draggingRef = useRef(false)
 
   const bars = useMemo(
     () => generateTrackWaveform(trackId, trackName, durationMs, barCount),
@@ -47,6 +52,12 @@ export function TrackWaveform({
   )
 
   const [pulseMap, setPulseMap] = useState<Record<number, number>>({})
+
+  /** Progresso 0–100, limitado às extremidades */
+  const progressPct =
+    isCurrent && Number.isFinite(progress)
+      ? Math.min(100, Math.max(0, progress * 100))
+      : 0
 
   useEffect(() => {
     if (!isActive) {
@@ -61,7 +72,6 @@ export function TrackWaveform({
       for (let i = 0; i < bars.length; i++) {
         const distance = Math.abs(i - playhead)
         if (i <= playhead && distance <= 6) {
-          // Oscilação forte perto do cursor; leve nas barras já tocadas recentes
           const intensity = 1 - distance / 7
           next[i] = 0.82 + Math.random() * 0.38 * intensity
         }
@@ -74,33 +84,66 @@ export function TrackWaveform({
     return () => window.clearInterval(id)
   }, [isActive, bars.length])
 
-  function handleBarClick(event: MouseEvent, index: number) {
-    event.stopPropagation()
-    if (!interactiveSeek) return
-    if (!isCurrent && !onBarClick) return
+  function fractionFromClientX(clientX: number) {
+    const el = containerRef.current
+    if (!el) return 0
+    const rect = el.getBoundingClientRect()
+    if (rect.width <= 0) return 0
+    return Math.min(1, Math.max(0, (clientX - rect.left) / rect.width))
+  }
 
-    const fraction = bars.length <= 1 ? 0 : index / (bars.length - 1)
+  function applySeek(fraction: number) {
     onBarClick?.(fraction)
     if (isCurrent) seekTo(fraction)
   }
 
-  const playheadIndex = isCurrent
-    ? Math.min(bars.length - 1, Math.floor(progress * bars.length))
-    : -1
+  function handlePointerDown(event: ReactPointerEvent<HTMLDivElement>) {
+    if (!canSeek) return
+    event.preventDefault()
+    draggingRef.current = true
+    event.currentTarget.setPointerCapture(event.pointerId)
+    applySeek(fractionFromClientX(event.clientX))
+  }
+
+  function handlePointerMove(event: ReactPointerEvent<HTMLDivElement>) {
+    if (!canSeek || !draggingRef.current) return
+    applySeek(fractionFromClientX(event.clientX))
+  }
+
+  function handlePointerUp(event: ReactPointerEvent<HTMLDivElement>) {
+    if (!draggingRef.current) return
+    draggingRef.current = false
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId)
+    }
+  }
 
   return (
     <div
-      className={`flex w-full items-end gap-[2px] overflow-hidden ${className}`}
+      ref={containerRef}
+      className={`flex h-full w-full items-end justify-between gap-[2px] overflow-hidden ${
+        canSeek ? 'cursor-pointer' : ''
+      } ${className}`}
       role={isCurrent && interactiveSeek ? 'slider' : undefined}
       aria-label={isCurrent ? 'Waveform — clique para procurar' : undefined}
       aria-valuemin={isCurrent ? 0 : undefined}
       aria-valuemax={isCurrent ? 100 : undefined}
-      aria-valuenow={isCurrent ? Math.round(progress * 100) : undefined}
+      aria-valuenow={isCurrent ? Math.round(progressPct) : undefined}
+      onPointerDown={canSeek ? handlePointerDown : undefined}
+      onPointerMove={canSeek ? handlePointerMove : undefined}
+      onPointerUp={canSeek ? handlePointerUp : undefined}
+      onPointerCancel={canSeek ? handlePointerUp : undefined}
     >
       {bars.map((baseHeight, index) => {
         const pulse = pulseMap[index] ?? 1
         const heightPct = Math.min(100, Math.max(15, baseHeight * pulse))
-        const isPlayed = isCurrent && index <= playheadIndex
+        const barThreshold = ((index + 1) / bars.length) * 100
+        const isPlayed =
+          isCurrent && (barThreshold <= progressPct || progressPct >= 99.5)
+        const playheadIndex = Math.min(
+          bars.length - 1,
+          Math.floor((progressPct / 100) * bars.length),
+        )
         const isNearPlayhead =
           isActive && Math.abs(index - playheadIndex) <= 2
 
@@ -111,56 +154,47 @@ export function TrackWaveform({
             maxHeight: '16px',
             transformOrigin: 'bottom',
             transform: isNearPlayhead ? `scaleY(${pulse})` : undefined,
-            transition: 'height 100ms linear, transform 100ms linear, background-color 200ms',
+            transition:
+              'height 100ms linear, transform 100ms linear, background-color 200ms',
           }
         } else {
           heightStyle = {
             height: `${heightPct}%`,
             transformOrigin: 'bottom',
-            transform: isNearPlayhead ? `scaleY(${Math.min(1.15, pulse)})` : undefined,
-            transition: 'height 100ms linear, transform 100ms linear, background-color 200ms, opacity 200ms',
+            transform: isNearPlayhead
+              ? `scaleY(${Math.min(1.15, pulse)})`
+              : undefined,
+            transition:
+              'height 100ms linear, transform 100ms linear, background-color 200ms, opacity 200ms',
           }
         }
 
-        const widthClass =
-          variant === 'compact'
-            ? 'w-0.5'
-            : variant === 'player'
-              ? 'w-[3px]'
-              : 'w-1'
+        const colorClass =
+          isPlayed || isActive
+            ? isNearPlayhead || progressPct >= 99.5
+              ? 'bg-cyan-400 shadow-[0_0_8px_rgba(34,211,238,0.45)]'
+              : 'bg-gradient-to-t from-cyan-600 to-cyan-400'
+            : variant === 'album'
+              ? 'bg-gray-600 hover:bg-cyan-400'
+              : 'bg-gray-700 group-hover:bg-gradient-to-t group-hover:from-cyan-600 group-hover:to-cyan-400'
 
-        const colorClass = isPlayed || isActive
-          ? isNearPlayhead
-            ? 'bg-cyan-300'
-            : 'bg-gradient-to-t from-cyan-600 to-cyan-400'
-          : variant === 'album'
-            ? 'bg-gray-600 hover:bg-cyan-400'
-            : 'bg-gray-700 group-hover:bg-gradient-to-t group-hover:from-cyan-600 group-hover:to-cyan-400'
-
-        const opacity =
-          isPlayed
-            ? 1
-            : isCurrent
-              ? 0.35
-              : variant === 'compact'
-                ? index < 12
-                  ? 1
-                  : 0.45
-                : index / bars.length < 0.25
-                  ? 1
-                  : 0.4
+        const opacity = isPlayed
+          ? 1
+          : isCurrent
+            ? 0.35
+            : variant === 'compact'
+              ? index < 12
+                ? 1
+                : 0.45
+              : index / bars.length < 0.25
+                ? 1
+                : 0.4
 
         return (
-          <button
+          <div
             key={index}
-            type="button"
-            tabIndex={-1}
             aria-hidden
-            disabled={!interactiveSeek || (!isCurrent && !onBarClick)}
-            onClick={(event) => handleBarClick(event, index)}
-            className={`${widthClass} shrink-0 rounded-sm ${colorClass} ${
-              interactiveSeek && isCurrent ? 'cursor-pointer' : 'cursor-default'
-            } ${barClassName}`}
+            className={`min-w-[2px] flex-1 rounded-full ${colorClass} ${barClassName}`}
             style={{ ...heightStyle, opacity }}
           />
         )
