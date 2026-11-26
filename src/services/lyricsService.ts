@@ -1146,26 +1146,42 @@ export function getPlainLyricLines(result: LyricsResult): string[] {
 
 /**
  * Alinha a letra ao áudio real via Gemini (POST /api/lyrics/ai-sync).
- * Persiste em azuri_lyrics_v3_* com isAiSynced: true.
+ * Persiste em azuri_lyrics_v3_* com isAiSynced: true e zera offset local.
+ * audioUrl pode ser vazio — o backend resolve o stream por title+artist.
  */
 export async function syncLyricsWithGemini(
   track: {
     id: string
     name: string
     artists?: Array<{ name?: string }>
+    audioUrl?: string
+    streamUrl?: string
+    previewUrl?: string
   },
   plainLines: string[],
   currentAudioSrc: string | null | undefined,
   options?: { durationSec?: number; force?: boolean },
 ): Promise<LyricsResult | null> {
   const lines = plainLines.map((line) => line.trim()).filter(Boolean)
-  const audioUrl = currentAudioSrc?.trim()
-  if (!track.id || lines.length === 0 || !audioUrl) return null
+  if (!track.id || lines.length === 0) return null
+
+  const audioUrl = (
+    currentAudioSrc?.trim() ||
+    track.streamUrl?.trim() ||
+    track.previewUrl?.trim() ||
+    track.audioUrl?.trim() ||
+    ''
+  ).replace(/^blob:.*/i, '')
 
   const artist =
     primaryArtistName(
       track.artists?.map((a) => a.name ?? '').filter(Boolean).join(', ') ?? '',
     ) || 'Unknown'
+
+  const durationSec =
+    options?.durationSec && options.durationSec > 0
+      ? options.durationSec
+      : undefined
 
   try {
     const res = await fetch(LYRICS_AI_SYNC_API, {
@@ -1174,13 +1190,12 @@ export async function syncLyricsWithGemini(
       body: JSON.stringify({
         title: cleanTrackTitle(track.name) || track.name,
         artist,
+        trackId: track.id,
         lines,
         audioUrl,
         force: options?.force === true,
-        durationSec:
-          options?.durationSec && options.durationSec > 0
-            ? options.durationSec
-            : undefined,
+        duration: durationSec,
+        durationSec,
       }),
     })
 
@@ -1201,10 +1216,10 @@ export async function syncLyricsWithGemini(
         text: String(line.text ?? '').trim(),
       }))
       .filter((line) => line.text && Number.isFinite(line.time) && line.time >= 0)
-      .sort((a, b) => a.time - b.time)
 
     if (syncedLines.length === 0) return null
 
+    // Preservar ordem original dos versos (já alinhados 1-para-1 no server)
     const plainText = lines.join('\n')
     const source = data.source || 'gemini'
 
@@ -1214,6 +1229,9 @@ export async function syncLyricsWithGemini(
       source,
       isAiSynced: true,
     })
+
+    // Offset antigo não pode desalinear o resultado da IA
+    writeLyricsTiming(track.id, { offsetSeconds: 0 })
 
     return {
       lines: syncedLines,
@@ -1227,4 +1245,19 @@ export async function syncLyricsWithGemini(
     console.error('syncLyricsWithGemini falhou:', error)
     return null
   }
+}
+
+/** True quando a letra ainda merece upgrade Gemini (sem LRC oficial). */
+export function shouldUpgradeWithGemini(result: LyricsResult | null): boolean {
+  if (!result || result.lines.length === 0) return false
+  if (result.isAiSynced) return false
+  if (
+    !result.isEstimated &&
+    (result.source === 'custom-lrc' ||
+      result.source === 'custom' ||
+      Boolean(result.source?.includes('lrclib-synced')))
+  ) {
+    return false
+  }
+  return true
 }

@@ -144,6 +144,10 @@ export function recordTrackPlay(track: TrackLike): void {
     const history = readHistory()
     const existingIndex = history.findIndex((item) => item.trackId === track.id)
     const now = Date.now()
+    const isNewOrBump =
+      existingIndex < 0 ||
+      history[existingIndex]?.trackId !== track.id ||
+      existingIndex > 0
 
     if (existingIndex >= 0) {
       const existing = history[existingIndex]
@@ -170,6 +174,11 @@ export function recordTrackPlay(track: TrackLike): void {
     }
 
     writeHistory(history)
+
+    // Play de faixa nova (ou reordenação) invalida o cache da Home
+    if (isNewOrBump) {
+      clearHomeRecommendationsCache()
+    }
   } catch {
     // ignore storage failures
   }
@@ -311,9 +320,17 @@ async function searchCatalogSafe(query: string) {
   }
 }
 
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms))
+}
+
+/** Máximo de consultas Spotify na carga da Home — reserva cota para a pesquisa. */
+const HOME_MAX_SPOTIFY_QUERIES = 4
+const HOME_QUERY_GAP_MS = 120
+
 /**
  * Gera prateleiras da Home a partir dos gêneros do perfil + histórico/curtidas.
- * Usa apenas /v1/search (type=track,artist) — sem endpoints depreciados.
+ * No máximo 3–4 consultas Spotify (sequenciais), com cache de 5 min.
  */
 export async function getPersonalizedHomeData(options?: {
   forceRefresh?: boolean
@@ -360,93 +377,56 @@ export async function getPersonalizedHomeData(options?: {
   seedArtists.sort((a, b) => b.score - a.score)
 
   const primaryGenre = favoriteGenres[0]
+  const secondaryGenre = favoriteGenres[1] ?? primaryGenre
   const lastListenedArtist = history[0]?.artistName
+  const becauseSeed = seedArtists[0]?.artistName ?? history[0]?.artistName ?? null
+
   const primarySearch =
     lastListenedArtist && history.length > 0
       ? `${pickSearchTerm(primaryGenre)} ${lastListenedArtist}`
       : `${pickSearchTerm(primaryGenre)} new`
 
-  // Parallel fetches for featured, mixes, because-you-listened, suggestions, new tracks
-  const mixSeeds: Array<{ label: string; query: string; kind: 'genre' | 'artist' }> = []
+  type MixSeed = { label: string; query: string; kind: 'genre' | 'artist' }
 
-  for (const genre of favoriteGenres.slice(0, 3)) {
-    mixSeeds.push({
-      label: genre,
-      query: pickSearchTerm(genre),
+  const mixSeeds: MixSeed[] = [
+    {
+      label: primaryGenre,
+      query: pickSearchTerm(primaryGenre),
       kind: 'genre',
-    })
-  }
+    },
+    {
+      label: secondaryGenre,
+      query: pickSearchTerm(secondaryGenre, 1),
+      kind: 'genre',
+    },
+  ]
 
-  for (const artist of seedArtists.slice(0, 3)) {
-    if (mixSeeds.length >= 5) break
+  if (seedArtists[0]?.artistName) {
     mixSeeds.push({
-      label: artist.artistName,
-      query: `artist:"${artist.artistName}"`,
+      label: seedArtists[0].artistName,
+      query: seedArtists[0].artistName,
       kind: 'artist',
     })
   }
 
-  while (mixSeeds.length < 5) {
-    const genre = favoriteGenres[mixSeeds.length % favoriteGenres.length]
-    const termIndex = Math.floor(mixSeeds.length / favoriteGenres.length) + 1
-    mixSeeds.push({
-      label: genre,
-      query: pickSearchTerm(genre, termIndex),
-      kind: 'genre',
-    })
+  // Até 4 consultas totais: 1 catalog featured + até 2 mixes tracks + 1 because/catalog
+  const featuredCatalog = await searchCatalogSafe(primarySearch)
+  await delay(HOME_QUERY_GAP_MS)
+
+  const mixResults: Array<{ seed: MixSeed; tracks: SpotifyTrack[] }> = []
+  const mixBudget = Math.min(2, HOME_MAX_SPOTIFY_QUERIES - 2)
+  for (const seed of mixSeeds.slice(0, Math.max(1, mixBudget))) {
+    const tracks = await searchTracksSafe(seed.query, 10)
+    mixResults.push({ seed, tracks: dedupeTracks(tracks).slice(0, 10) })
+    await delay(HOME_QUERY_GAP_MS)
   }
 
-  const becauseSeed = seedArtists[0]?.artistName ?? history[0]?.artistName ?? null
+  const becauseCatalog = becauseSeed
+    ? await searchCatalogSafe(becauseSeed)
+    : await searchCatalogSafe(pickSearchTerm(secondaryGenre, 2))
 
-  const genreArtistQueries = favoriteGenres.slice(0, 3).map((genre, index) => ({
-    genre,
-    query: pickSearchTerm(genre, index),
-  }))
-
-  const [
-    featuredCatalog,
-    mixResults,
-    becauseCatalog,
-    genreArtistResults,
-    newTrackBatches,
-  ] = await Promise.all([
-    searchCatalogSafe(primarySearch),
-    Promise.all(
-      mixSeeds.slice(0, 5).map(async (seed) => {
-        const tracks = await searchTracksSafe(seed.query, 10)
-        return { seed, tracks: dedupeTracks(tracks).slice(0, 10) }
-      }),
-    ),
-    becauseSeed
-      ? searchCatalogSafe(`${becauseSeed} similar`)
-      : Promise.resolve({
-          tracks: [] as SpotifyTrack[],
-          artists: [] as SpotifyArtist[],
-          playlists: [],
-        }),
-    Promise.all(
-      genreArtistQueries.map(async ({ genre, query }) => {
-        const catalog = await searchCatalogSafe(query)
-        return { genre, artists: catalog.artists, tracks: catalog.tracks }
-      }),
-    ),
-    Promise.all(
-      favoriteGenres.slice(0, 3).map((genre, index) => {
-        const year = new Date().getFullYear()
-        return searchTracksSafe(
-          `${pickSearchTerm(genre, index)} year:${year - 1}-${year}`,
-          8,
-        ).then((tracks) =>
-          tracks.length > 0
-            ? tracks
-            : searchTracksSafe(`${pickSearchTerm(genre, index)} new`, 8),
-        )
-      }),
-    ),
-  ])
-
-  // Featured release
-  let featuredTrack =
+  // Featured release — só reutiliza o 1º catalog (sem fallback HTTP extra)
+  const featuredTrack =
     featuredCatalog.tracks.find((t) =>
       favoriteGenres.some((g) =>
         expandGenre(g).some((term) =>
@@ -454,11 +434,6 @@ export async function getPersonalizedHomeData(options?: {
         ),
       ),
     ) ?? featuredCatalog.tracks[0] ?? null
-
-  if (!featuredTrack) {
-    const fallback = await searchTracksSafe(pickSearchTerm(primaryGenre), 5)
-    featuredTrack = fallback[0] ?? null
-  }
 
   const badgeReason = lastListenedArtist && history.length > 0
     ? `RECOMENDADO • BASEADO EM ${lastListenedArtist.toUpperCase()}`
@@ -468,7 +443,7 @@ export async function getPersonalizedHomeData(options?: {
     ? { track: featuredTrack, badgeReason }
     : null
 
-  // Personalized mixes
+  // Personalized mixes (derivados das poucas buscas)
   const personalizedMixes: PersonalizedMix[] = mixResults
     .filter((result) => result.tracks.length > 0)
     .map((result, index) => {
@@ -494,21 +469,34 @@ export async function getPersonalizedHomeData(options?: {
     })
     .slice(0, 5)
 
-  // Because you listened
+  // Mix extra a partir do featured catalog (sem nova request)
+  if (
+    personalizedMixes.length < 3 &&
+    featuredCatalog.tracks.length > 0
+  ) {
+    const leftover = dedupeTracks(featuredCatalog.tracks).slice(0, 10)
+    if (leftover.length > 0) {
+      personalizedMixes.push({
+        id: `azuri-mix-featured-${primaryGenre.toLowerCase().replace(/\s+/g, '-')}`,
+        name: `Mix • ${primaryGenre}`,
+        description: `Seleção dinâmica de ${primaryGenre}`,
+        imageUrl:
+          leftover[0]?.albumCoverUrl ||
+          'https://picsum.photos/seed/azuri-mix/300/300',
+        tracks: leftover,
+        seedLabel: primaryGenre,
+      })
+    }
+  }
+
+  // Because you listened — reutiliza becauseCatalog (sem searchTracks extra)
   let becauseYouListened: BecauseYouListened | null = null
   if (becauseSeed && (history.length > 0 || liked.length > 0)) {
-    const similarTracks = dedupeTracks(
+    const similarFromSearch = dedupeTracks(
       becauseCatalog.tracks.filter(
         (t) => t.artistName.toLowerCase() !== becauseSeed.toLowerCase(),
       ),
     ).slice(0, 10)
-
-    const similarFromSearch =
-      similarTracks.length > 0
-        ? similarTracks
-        : dedupeTracks(await searchTracksSafe(becauseSeed, 10))
-            .filter((t) => t.artistName.toLowerCase() !== becauseSeed.toLowerCase())
-            .slice(0, 10)
 
     const similarArtists = dedupeArtists([
       ...becauseCatalog.artists.filter(
@@ -526,11 +514,29 @@ export async function getPersonalizedHomeData(options?: {
     }
   }
 
-  // Suggested artists (exclude followed)
+  // Suggested artists — derivados dos catalogs já obtidos
   const suggestedArtists: SuggestedArtist[] = []
   const seenArtistIds = new Set<string>()
+  const artistPools: Array<{ genre: string; artists: SpotifyArtist[]; tracks: SpotifyTrack[] }> =
+    [
+      {
+        genre: primaryGenre,
+        artists: featuredCatalog.artists,
+        tracks: featuredCatalog.tracks,
+      },
+      {
+        genre: secondaryGenre,
+        artists: becauseCatalog.artists,
+        tracks: becauseCatalog.tracks,
+      },
+      ...mixResults.map((result) => ({
+        genre: result.seed.label,
+        artists: artistsFromTracks(result.tracks),
+        tracks: result.tracks,
+      })),
+    ]
 
-  for (const batch of genreArtistResults) {
+  for (const batch of artistPools) {
     for (const artist of batch.artists) {
       if (followingIds.has(artist.id) || seenArtistIds.has(artist.id)) continue
       seenArtistIds.add(artist.id)
@@ -540,9 +546,8 @@ export async function getPersonalizedHomeData(options?: {
     if (suggestedArtists.length >= 5) break
   }
 
-  // Fallback: extract artists from genre tracks
   if (suggestedArtists.length < 5) {
-    for (const batch of genreArtistResults) {
+    for (const batch of artistPools) {
       for (const artist of artistsFromTracks(batch.tracks)) {
         if (followingIds.has(artist.id) || seenArtistIds.has(artist.id)) continue
         seenArtistIds.add(artist.id)
@@ -553,8 +558,12 @@ export async function getPersonalizedHomeData(options?: {
     }
   }
 
-  // New tracks for the right rail bubbles
-  const newTracks = dedupeTracks(newTrackBatches.flat()).slice(0, 8)
+  // New tracks — reutiliza mixes + featured (sem year: queries extras)
+  const newTracks = dedupeTracks([
+    ...mixResults.flatMap((r) => r.tracks),
+    ...featuredCatalog.tracks,
+    ...becauseCatalog.tracks,
+  ]).slice(0, 8)
 
   const data: PersonalizedHomeData = {
     featuredRelease,

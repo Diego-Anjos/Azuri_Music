@@ -25,6 +25,7 @@ import {
   saveCustomLrc,
   saveCustomLyrics,
   searchLyricsCandidates,
+  shouldUpgradeWithGemini,
   syncLyricsWithGemini,
   writeLyricsTiming,
   type LyricLine,
@@ -384,11 +385,30 @@ export function LyricsView() {
   }
 
   function resolveCurrentAudioSrc(): string | null {
-    const fromStore = localAudioUrl?.trim()
-    if (fromStore) return fromStore
     const audio = getPlayerAudioElement()
-    const src = (audio?.currentSrc || audio?.src || '').trim()
-    return src || null
+    const fromElement = (audio?.currentSrc || audio?.src || '').trim()
+    if (fromElement && !/^blob:/i.test(fromElement)) return fromElement
+
+    const fromStore = localAudioUrl?.trim()
+    if (fromStore && !/^blob:/i.test(fromStore)) return fromStore
+
+    const trackAny = currentTrack as
+      | (typeof currentTrack & {
+          streamUrl?: string
+          previewUrl?: string
+          audioUrl?: string
+        })
+      | null
+    const fromTrack = (
+      trackAny?.streamUrl ||
+      trackAny?.previewUrl ||
+      trackAny?.audioUrl ||
+      ''
+    ).trim()
+    if (fromTrack && !/^blob:/i.test(fromTrack)) return fromTrack
+
+    // Vazio → backend resolve stream por title+artist
+    return ''
   }
 
   async function runAiSync(options?: { force?: boolean }) {
@@ -397,12 +417,12 @@ export function LyricsView() {
     if (!options?.force && lyrics.isAiSynced) return
 
     const plainLines = getPlainLyricLines(lyrics)
-    const audioSrc = resolveCurrentAudioSrc()
-    if (plainLines.length === 0 || !audioSrc) {
+    if (plainLines.length === 0) {
       setAiSyncStatus('error')
       return
     }
 
+    const audioSrc = resolveCurrentAudioSrc()
     const { duration: audioDuration } = readAudioClock(progress, duration)
     aiSyncInFlightRef.current = true
     setAiSyncStatus('listening')
@@ -424,6 +444,7 @@ export function LyricsView() {
       return
     }
 
+    // Atualiza versos + zera offset antigo para não desalinear a IA
     setLyrics(next)
     setSyncOffset(0)
     persistOffset(0)
@@ -431,16 +452,14 @@ export function LyricsView() {
     setAiSyncStatus('done')
   }
 
-  // Auto Gemini sync em background para letras sem LRC oficial
+  // Upgrade automático: mostra a letra na hora e sincroniza com Gemini em background
+  // (inclui caches antigos sem isAiSynced / sem LRC oficial)
   useEffect(() => {
     if (!currentTrack || loading) return
-    if (!lyrics?.isEstimated || lyrics.isAiSynced) return
+    if (!shouldUpgradeWithGemini(lyrics)) return
     if (isExactSync) return
 
-    const audioSrc = resolveCurrentAudioSrc()
-    if (!audioSrc) return
-
-    const key = `${currentTrack.id}::${lyrics.source}::${lyrics.lines[0]?.text ?? ''}`
+    const key = `${currentTrack.id}::${lyrics?.source ?? ''}::${lyrics?.lines[0]?.text ?? ''}`
     if (autoAiKeyRef.current === key) return
     autoAiKeyRef.current = key
 
@@ -768,15 +787,15 @@ export function LyricsView() {
                 type="button"
                 onClick={() => void runAiSync({ force: true })}
                 title="Reexecutar alinhamento Gemini"
-                className="inline-flex shrink-0 items-center gap-1.5 rounded-full border border-violet-400/35 bg-gradient-to-r from-cyan-400/15 to-violet-500/20 px-3 py-1 text-[11px] font-semibold tracking-wide whitespace-nowrap text-cyan-200 transition-colors hover:border-cyan-300/50 hover:text-white"
+                className="inline-flex shrink-0 items-center gap-1.5 rounded-full border border-cyan-400/40 bg-cyan-400/15 px-3 py-1 text-[11px] font-semibold tracking-wide whitespace-nowrap text-cyan-300 shadow-[0_0_14px_rgba(34,211,238,0.25)] transition-colors hover:border-cyan-300/70 hover:bg-cyan-400/20 hover:text-cyan-200"
               >
                 <Sparkles
-                  className="size-3.5 text-violet-300"
+                  className="size-3.5 text-cyan-300"
                   strokeWidth={ICON_STROKE}
                 />
-                IA Sincronizada
+                Sincronizado com Gemini
               </button>
-            ) : lyrics?.isEstimated ? (
+            ) : shouldUpgradeWithGemini(lyrics) ? (
               <button
                 type="button"
                 onClick={() => void runAiSync({ force: true })}

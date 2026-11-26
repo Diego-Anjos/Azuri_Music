@@ -1,11 +1,14 @@
-# Environment / secrets (SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET)
+# Environment / secrets (Gemini, Spotify, etc.) — nunca commitar chaves
 .env
+*.env
+server/.env
 .env.local
 .env.development
 .env.production
 .env.*.local
 .env.*
 !.env.example
+!server/.env.example
 *.local
 
 # Dependencies
@@ -14,11 +17,14 @@ node_modules/
 # Build / distribution / caches
 dist/
 dist-ssr/
+server/dist/
 build/
 .output/
 .vite/
 .turbo
 .next
+*.tsbuildinfo
+cache/
 cache/*
 !cache/.gitkeep
 

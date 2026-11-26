@@ -350,10 +350,21 @@ export function toggleLikedTrack(
     const next = [...tracks]
     next.splice(existingIndex, 1)
     writeLikedTracks(next)
+    // Curtir/descurtir invalida recomendações da Home (evita import circular)
+    try {
+      sessionStorage.removeItem('azuri_home_recs_cache')
+    } catch {
+      // ignore
+    }
     return false
   }
 
   writeLikedTracks([{ ...normalized, likedAt: Date.now() }, ...tracks])
+  try {
+    sessionStorage.removeItem('azuri_home_recs_cache')
+  } catch {
+    // ignore
+  }
   return true
 }
 

@@ -1,7 +1,8 @@
+import 'dotenv/config'
 import { spawn } from 'node:child_process'
-import { existsSync, readFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { config as loadDotenv } from 'dotenv'
 import cors from 'cors'
 import express from 'express'
 import play from 'play-dl'
@@ -17,37 +18,20 @@ import {
   type LyricsSearchVariant,
 } from './utils/lyricsNormalizer.js'
 
-/** Carrega server/.env sem dependência extra (não sobrescreve env já definida). */
-function loadServerEnv() {
-  const candidates = [
-    resolve(process.cwd(), '.env'),
-    resolve(dirname(fileURLToPath(import.meta.url)), '../.env'),
-  ]
-  for (const filePath of candidates) {
-    if (!existsSync(filePath)) continue
-    for (const line of readFileSync(filePath, 'utf8').split(/\r?\n/)) {
-      const trimmed = line.trim()
-      if (!trimmed || trimmed.startsWith('#')) continue
-      const eq = trimmed.indexOf('=')
-      if (eq <= 0) continue
-      const key = trimmed.slice(0, eq).trim()
-      let value = trimmed.slice(eq + 1).trim()
-      if (
-        (value.startsWith('"') && value.endsWith('"')) ||
-        (value.startsWith("'") && value.endsWith("'"))
-      ) {
-        value = value.slice(1, -1)
-      }
-      if (!(key in process.env)) process.env[key] = value
-    }
-    break
-  }
-}
-
-loadServerEnv()
+// Garante server/.env mesmo se o cwd não for a pasta server/
+loadDotenv({
+  path: resolve(dirname(fileURLToPath(import.meta.url)), '../.env'),
+})
 
 const app = express()
 const PORT = Number(process.env.PORT) || 3001
+
+const GEMINI_KEY_PLACEHOLDER = /COLE_SUA_CHAVE|sua_chave_aqui|your[_-]?key/i
+
+function isGeminiConfigured(): boolean {
+  const key = process.env.GEMINI_API_KEY?.trim() ?? ''
+  return key.length > 0 && !GEMINI_KEY_PLACEHOLDER.test(key)
+}
 
 app.use(cors())
 app.use(express.json({ limit: '2mb' }))
@@ -944,6 +928,140 @@ async function handleArtistTracksRequest(
 
 /** Catálogo público de faixas do artista no SoundCloud. */
 app.get('/api/artist-tracks', handleArtistTracksRequest)
+
+type SearchApiTrack = {
+  id: string
+  name: string
+  artistName: string
+  artists: Array<{ id: string; name: string }>
+  albumCoverUrl: string
+  albumName?: string
+  durationMs: number
+}
+
+type SearchApiArtist = {
+  id: string
+  name: string
+  imageUrl: string
+}
+
+type SearchApiPayload = {
+  tracks: SearchApiTrack[]
+  artists: SearchApiArtist[]
+  playlists: []
+}
+
+async function searchSoundCloudCatalog(
+  query: string,
+): Promise<SearchApiPayload> {
+  const empty: SearchApiPayload = { tracks: [], artists: [], playlists: [] }
+  const clientId = await getSoundCloudClientId()
+  if (!clientId) return empty
+
+  const q = encodeURIComponent(query.trim())
+  const headers = SC_HEADERS
+
+  const [tracksRes, usersRes] = await Promise.all([
+    fetch(
+      `https://api-v2.soundcloud.com/search/tracks?q=${q}&client_id=${clientId}&limit=12&app_locale=pt`,
+      { headers },
+    ),
+    fetch(
+      `https://api-v2.soundcloud.com/search/users?q=${q}&client_id=${clientId}&limit=8&app_locale=pt`,
+      { headers },
+    ),
+  ])
+
+  const tracks: SearchApiTrack[] = []
+  const artists: SearchApiArtist[] = []
+  const seenTracks = new Set<string>()
+  const seenArtists = new Set<string>()
+
+  if (tracksRes.ok) {
+    const data = (await tracksRes.json()) as {
+      collection?: SoundCloudApiTrack[] | null
+    }
+    for (const item of data.collection ?? []) {
+      if (!item?.id || !item.title?.trim()) continue
+      const id = `sc-${item.id}`
+      if (seenTracks.has(id)) continue
+      seenTracks.add(id)
+
+      const artistName =
+        item.user?.username?.trim() || 'Artista desconhecido'
+      const artistId = item.user?.id
+        ? `sc-user-${item.user.id}`
+        : `sc-user-${artistName.toLowerCase()}`
+      const artwork =
+        upgradeSoundCloudArtwork(item.artwork_url) ||
+        upgradeSoundCloudArtwork(item.user?.avatar_url) ||
+        ''
+
+      tracks.push({
+        id,
+        name: item.title.trim(),
+        artistName,
+        artists: [{ id: artistId, name: artistName }],
+        albumCoverUrl: artwork,
+        albumName: item.title.trim(),
+        durationMs: typeof item.duration === 'number' ? item.duration : 0,
+      })
+
+      if (!seenArtists.has(artistId)) {
+        seenArtists.add(artistId)
+        artists.push({
+          id: artistId,
+          name: artistName,
+          imageUrl:
+            upgradeSoundCloudArtwork(item.user?.avatar_url) || artwork || '',
+        })
+      }
+    }
+  }
+
+  if (usersRes.ok) {
+    const data = (await usersRes.json()) as {
+      collection?: SoundCloudApiUser[] | null
+    }
+    for (const user of data.collection ?? []) {
+      if (!user?.id || !user.username?.trim()) continue
+      const id = `sc-user-${user.id}`
+      if (seenArtists.has(id)) continue
+      seenArtists.add(id)
+      artists.push({
+        id,
+        name: user.username.trim(),
+        imageUrl: upgradeSoundCloudArtwork(user.avatar_url) || '',
+      })
+    }
+  }
+
+  return {
+    tracks: tracks.slice(0, 20),
+    artists: artists.slice(0, 12),
+    playlists: [],
+  }
+}
+
+/**
+ * Pesquisa multi-fonte (SoundCloud) — fallback quando Spotify está em 429
+ * ou não indexa artistas underground.
+ */
+app.get('/api/search', async (req, res) => {
+  try {
+    const q = req.query.q
+    if (!q || typeof q !== 'string' || !q.trim()) {
+      res.status(200).json({ tracks: [], artists: [], playlists: [] })
+      return
+    }
+
+    const payload = await searchSoundCloudCatalog(q.trim())
+    res.status(200).json(payload)
+  } catch (error) {
+    console.error('Erro em /api/search:', error)
+    res.status(200).json({ tracks: [], artists: [], playlists: [] })
+  }
+})
 
 /* -------------------------------------------------------------------------- */
 /*  Agregador Multi-Fontes de Letras (cascata + cache)                         */
@@ -1843,5 +1961,10 @@ app.post('/api/lyrics/ai-sync', (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`Azuri resolve server em http://localhost:${PORT}`)
+  if (isGeminiConfigured()) {
+    console.log('✅ Gemini AI Sync configurado e ativo')
+  } else {
+    console.warn('⚠️ GEMINI_API_KEY não encontrada no server/.env')
+  }
 })
 

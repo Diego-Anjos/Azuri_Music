@@ -1,8 +1,18 @@
 import { Play, Search as SearchIcon, User } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { PlaylistCard } from '../components/PlaylistCard'
+import { getUserReleases } from '../services/creatorService'
 import {
+  getLikedTracks,
+  getPlaylists,
+  getRecentPlays,
+  type FollowingArtist,
+  getFollowingArtists,
+} from '../services/libraryStorage'
+import { getListeningHistory } from '../services/recommendationService'
+import {
+  isSpotifyCoolingDown,
   searchCatalog,
   type SpotifyArtist,
   type SpotifyCatalogSearchResult,
@@ -15,12 +25,341 @@ import {
 } from '../store/usePlayerStore'
 
 const ICON_STROKE = 1.5
-const DEBOUNCE_MS = 400
+const DEBOUNCE_MS = 450
+const BACKEND_SEARCH_URL = 'http://localhost:3001/api/search'
 
 const emptyResults: SpotifyCatalogSearchResult = {
   tracks: [],
   artists: [],
   playlists: [],
+}
+
+type BackendSearchPayload = {
+  tracks?: Array<{
+    id?: string
+    name?: string
+    artistName?: string
+    artists?: Array<{ id?: string; name?: string }>
+    albumCoverUrl?: string
+    albumName?: string
+    durationMs?: number
+  } | null>
+  artists?: Array<{
+    id?: string
+    name?: string
+    imageUrl?: string
+  } | null>
+  playlists?: Array<{
+    id?: string
+    name?: string
+    description?: string
+    imageUrl?: string
+  } | null>
+}
+
+function matchesQuery(haystack: string, query: string): boolean {
+  const q = query.trim().toLowerCase()
+  if (!q) return false
+  return haystack.toLowerCase().includes(q)
+}
+
+/** Catálogo local: curtidas, histórico, recentes, playlists e artistas seguidos. */
+function searchLocalCatalog(query: string): SpotifyCatalogSearchResult {
+  const tracks: SpotifyTrack[] = []
+  const artists: SpotifyArtist[] = []
+  const playlists: SpotifyPlaylist[] = []
+  const seenTracks = new Set<string>()
+  const seenArtists = new Set<string>()
+
+  const pushTrack = (track: {
+    id: string
+    name: string
+    artists?: Array<{ id?: string; name?: string }>
+    artistName?: string
+    albumCoverUrl?: string
+    albumName?: string
+    albumReleaseDate?: string
+    durationMs?: number
+    duration_ms?: number
+    album?: {
+      name?: string
+      release_date?: string
+      images?: Array<{ url: string }> | null
+    } | null
+  }) => {
+    if (!track.id || !track.name || seenTracks.has(track.id)) return
+    const artistList =
+      track.artists && track.artists.length > 0
+        ? track.artists
+            .filter((a) => Boolean(a.name))
+            .map((a, index) => ({
+              id: a.id || `local-artist-${track.id}-${index}`,
+              name: a.name!,
+            }))
+        : [
+            {
+              id: `local-artist-${track.id}`,
+              name: track.artistName || 'Artista desconhecido',
+            },
+          ]
+
+    const blob = `${track.name} ${artistList.map((a) => a.name).join(' ')}`
+    if (!matchesQuery(blob, query)) return
+
+    seenTracks.add(track.id)
+    tracks.push({
+      id: track.id,
+      name: track.name,
+      artistName: artistList[0]?.name ?? 'Artista desconhecido',
+      artists: artistList,
+      albumCoverUrl:
+        track.albumCoverUrl || track.album?.images?.[0]?.url || '',
+      albumName: track.albumName || track.album?.name,
+      albumReleaseDate: track.albumReleaseDate || track.album?.release_date,
+      durationMs: track.durationMs ?? track.duration_ms ?? 0,
+    })
+
+    for (const artist of artistList) {
+      if (!artist.id || seenArtists.has(artist.id)) continue
+      if (!matchesQuery(artist.name, query) && !matchesQuery(blob, query)) {
+        continue
+      }
+      seenArtists.add(artist.id)
+      artists.push({
+        id: artist.id,
+        name: artist.name,
+        imageUrl: track.albumCoverUrl || track.album?.images?.[0]?.url || '',
+      })
+    }
+  }
+
+  for (const liked of getLikedTracks()) {
+    pushTrack(liked)
+  }
+
+  for (const entry of getListeningHistory()) {
+    pushTrack({
+      id: entry.trackId,
+      name: entry.name,
+      artistName: entry.artistName,
+      artists: [{ id: entry.artistId, name: entry.artistName }],
+      albumCoverUrl: entry.albumCoverUrl,
+    })
+  }
+
+  for (const recent of getRecentPlays(40)) {
+    if (recent.kind !== 'track') {
+      if (
+        recent.kind === 'artist' &&
+        matchesQuery(recent.name, query) &&
+        !seenArtists.has(recent.id)
+      ) {
+        seenArtists.add(recent.id)
+        artists.push({
+          id: recent.id,
+          name: recent.name,
+          imageUrl: recent.imageUrl,
+        })
+      }
+      continue
+    }
+    pushTrack({
+      id: recent.id,
+      name: recent.name,
+      artists: recent.artists,
+      albumCoverUrl: recent.imageUrl,
+      album: recent.album,
+      duration_ms: recent.duration_ms,
+    })
+  }
+
+  for (const playlist of getPlaylists()) {
+    if (matchesQuery(playlist.name, query)) {
+      playlists.push({
+        id: playlist.id,
+        name: playlist.name,
+        description: 'Playlist local',
+        imageUrl: playlist.coverUrl,
+      })
+    }
+    for (const track of playlist.tracks) {
+      pushTrack(track)
+    }
+  }
+
+  try {
+    for (const release of getUserReleases()) {
+      if (matchesQuery(release.title, query) || matchesQuery(release.artistName, query)) {
+        playlists.push({
+          id: release.id,
+          name: release.title,
+          description: `Estúdio • ${release.artistName}`,
+          imageUrl: release.coverUrl || '',
+        })
+      }
+      for (const track of release.tracks) {
+        const feats = track.featArtists
+          .split(',')
+          .map((name) => name.trim())
+          .filter(Boolean)
+        pushTrack({
+          id: track.id,
+          name: track.title,
+          artistName: release.artistName,
+          artists: [
+            { id: `studio-${release.artistName}`, name: release.artistName },
+            ...feats.map((name, index) => ({
+              id: `studio-feat-${track.id}-${index}`,
+              name,
+            })),
+          ],
+          albumCoverUrl: release.coverUrl || '',
+          albumName: release.title,
+          durationMs: track.durationMs,
+        })
+      }
+    }
+  } catch {
+    // ignore studio storage failures
+  }
+
+  let following: FollowingArtist[] = []
+  try {
+    following = getFollowingArtists()
+  } catch {
+    following = []
+  }
+
+  for (const artist of following) {
+    if (!matchesQuery(artist.name, query) || seenArtists.has(artist.id)) continue
+    seenArtists.add(artist.id)
+    artists.push({
+      id: artist.id,
+      name: artist.name,
+      imageUrl: artist.imageUrl ?? '',
+    })
+  }
+
+  return {
+    tracks: tracks.slice(0, 20),
+    artists: artists.slice(0, 12),
+    playlists: playlists.slice(0, 8),
+  }
+}
+
+function mapBackendSearch(
+  data: BackendSearchPayload,
+): SpotifyCatalogSearchResult {
+  const tracks: SpotifyTrack[] = (data.tracks ?? [])
+    .filter(
+      (item): item is NonNullable<typeof item> =>
+        item != null && Boolean(item.id) && Boolean(item.name),
+    )
+    .map((item) => {
+      const artists =
+        item.artists && item.artists.length > 0
+          ? item.artists
+              .filter((a) => Boolean(a.name))
+              .map((a, index) => ({
+                id: a.id || `be-artist-${item.id}-${index}`,
+                name: a.name!,
+              }))
+          : [
+              {
+                id: `be-artist-${item.id}`,
+                name: item.artistName || 'Artista desconhecido',
+              },
+            ]
+
+      return {
+        id: String(item.id),
+        name: item.name!,
+        artistName: artists[0]?.name ?? 'Artista desconhecido',
+        artists,
+        albumCoverUrl: item.albumCoverUrl ?? '',
+        albumName: item.albumName,
+        durationMs: item.durationMs ?? 0,
+      }
+    })
+
+  const artists: SpotifyArtist[] = (data.artists ?? [])
+    .filter(
+      (item): item is NonNullable<typeof item> =>
+        item != null && Boolean(item.id) && Boolean(item.name),
+    )
+    .map((item) => ({
+      id: String(item.id),
+      name: item.name!,
+      imageUrl: item.imageUrl ?? '',
+    }))
+
+  const playlists: SpotifyPlaylist[] = (data.playlists ?? [])
+    .filter(
+      (item): item is NonNullable<typeof item> =>
+        item != null && Boolean(item.id) && Boolean(item.name),
+    )
+    .map((item) => ({
+      id: String(item.id),
+      name: item.name!,
+      description: item.description ?? '',
+      imageUrl: item.imageUrl ?? '',
+    }))
+
+  return { tracks, artists, playlists }
+}
+
+async function fetchBackendSearch(
+  query: string,
+  signal: AbortSignal,
+): Promise<SpotifyCatalogSearchResult> {
+  try {
+    const response = await fetch(
+      `${BACKEND_SEARCH_URL}?q=${encodeURIComponent(query)}`,
+      { signal },
+    )
+    if (!response.ok) return emptyResults
+    const data = (await response.json()) as BackendSearchPayload
+    return mapBackendSearch(data)
+  } catch (error) {
+    if (signal.aborted) throw error
+    console.warn('Fallback /api/search indisponível:', error)
+    return emptyResults
+  }
+}
+
+function mergeSearchResults(
+  ...sources: SpotifyCatalogSearchResult[]
+): SpotifyCatalogSearchResult {
+  const tracks: SpotifyTrack[] = []
+  const artists: SpotifyArtist[] = []
+  const playlists: SpotifyPlaylist[] = []
+  const seenTracks = new Set<string>()
+  const seenArtists = new Set<string>()
+  const seenPlaylists = new Set<string>()
+
+  for (const source of sources) {
+    for (const track of source.tracks) {
+      if (!track.id || seenTracks.has(track.id)) continue
+      seenTracks.add(track.id)
+      tracks.push(track)
+    }
+    for (const artist of source.artists) {
+      if (!artist.id || seenArtists.has(artist.id)) continue
+      seenArtists.add(artist.id)
+      artists.push(artist)
+    }
+    for (const playlist of source.playlists) {
+      if (!playlist.id || seenPlaylists.has(playlist.id)) continue
+      seenPlaylists.add(playlist.id)
+      playlists.push(playlist)
+    }
+  }
+
+  return {
+    tracks: tracks.slice(0, 30),
+    artists: artists.slice(0, 16),
+    playlists: playlists.slice(0, 10),
+  }
 }
 
 export function Search() {
@@ -33,12 +372,17 @@ export function Search() {
     useState<SpotifyCatalogSearchResult>(emptyResults)
   const [isLoading, setIsLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const inputRef = useRef<HTMLInputElement>(null)
 
   useEffect(() => {
     const fromUrl = searchParams.get('q')?.trim() ?? ''
     setQuery(fromUrl)
     setDebouncedQuery(fromUrl)
   }, [searchParams])
+
+  useEffect(() => {
+    inputRef.current?.focus()
+  }, [])
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -56,28 +400,63 @@ export function Search() {
       return
     }
 
-    let cancelled = false
+    const controller = new AbortController()
 
     async function runSearch() {
       try {
         setIsLoading(true)
         setError(null)
-        const data = await searchCatalog(debouncedQuery)
-        if (!cancelled) setResults(data)
+
+        const local = searchLocalCatalog(debouncedQuery)
+        // Mostra catálogo local imediatamente (mesmo sob rate limit)
+        if (
+          local.tracks.length > 0 ||
+          local.artists.length > 0 ||
+          local.playlists.length > 0
+        ) {
+          setResults(local)
+        }
+
+        const [spotifySettled, backendSettled] = await Promise.allSettled([
+          isSpotifyCoolingDown()
+            ? Promise.resolve(emptyResults)
+            : searchCatalog(debouncedQuery),
+          fetchBackendSearch(debouncedQuery, controller.signal),
+        ])
+
+        if (controller.signal.aborted) return
+
+        const spotify =
+          spotifySettled.status === 'fulfilled'
+            ? spotifySettled.value
+            : emptyResults
+        const backend =
+          backendSettled.status === 'fulfilled'
+            ? backendSettled.value
+            : emptyResults
+
+        const merged = mergeSearchResults(local, spotify, backend)
+        setResults(merged)
       } catch (err) {
-        if (!cancelled) {
-          setResults(emptyResults)
+        if (controller.signal.aborted) return
+        const local = searchLocalCatalog(debouncedQuery)
+        setResults(local)
+        if (
+          local.tracks.length === 0 &&
+          local.artists.length === 0 &&
+          local.playlists.length === 0
+        ) {
           setError(err instanceof Error ? err.message : 'Erro na pesquisa')
         }
       } finally {
-        if (!cancelled) setIsLoading(false)
+        if (!controller.signal.aborted) setIsLoading(false)
       }
     }
 
     void runSearch()
 
     return () => {
-      cancelled = true
+      controller.abort()
     }
   }, [debouncedQuery])
 
@@ -87,8 +466,8 @@ export function Search() {
     results.playlists.length > 0
 
   return (
-    <main className="flex min-h-0 flex-1 flex-col overflow-y-auto bg-gradient-to-b from-[#1E293B] to-[#0B0F19]">
-      <header className="px-4 pb-2 pt-2 md:px-8 md:pt-4">
+    <main className="pointer-events-auto relative z-10 flex min-h-0 flex-1 flex-col overflow-y-auto bg-gradient-to-b from-[#1E293B] to-[#0B0F19]">
+      <header className="pointer-events-auto px-4 pb-2 pt-2 md:px-8 md:pt-4">
         <h2 className="mb-4 text-3xl font-bold text-[#F8FAFC]">Pesquisar</h2>
         <label className="relative block max-w-xl">
           <span className="sr-only">Buscar músicas, artistas e playlists</span>
@@ -97,7 +476,9 @@ export function Search() {
             strokeWidth={ICON_STROKE}
           />
           <input
+            ref={inputRef}
             type="search"
+            autoFocus
             value={query}
             onChange={(event) => setQuery(event.target.value)}
             onKeyDown={(event) => {
@@ -106,7 +487,7 @@ export function Search() {
               }
             }}
             placeholder="O que você quer ouvir?"
-            className="w-full rounded-full border border-white/10 bg-[#111827] py-3 pl-12 pr-4 text-sm text-[#F8FAFC] placeholder:text-[#94A3B8] outline-none transition-colors focus:border-[#00E5FF]/60 focus:ring-2 focus:ring-[#00E5FF]/30"
+            className="pointer-events-auto relative z-20 w-full rounded-full border border-white/10 bg-[#111827] py-3 pl-12 pr-4 text-sm text-[#F8FAFC] placeholder:text-[#94A3B8] outline-none transition-colors focus:border-[#00E5FF]/60 focus:ring-2 focus:ring-[#00E5FF]/30"
           />
         </label>
       </header>
@@ -118,11 +499,11 @@ export function Search() {
           </p>
         )}
 
-        {debouncedQuery && isLoading && (
+        {debouncedQuery && isLoading && !hasResults && (
           <p className="text-sm text-[#94A3B8]">A pesquisar...</p>
         )}
 
-        {debouncedQuery && !isLoading && error && (
+        {debouncedQuery && !isLoading && error && !hasResults && (
           <p className="text-sm text-red-400">{error}</p>
         )}
 
@@ -132,8 +513,13 @@ export function Search() {
           </p>
         )}
 
-        {debouncedQuery && !isLoading && !error && hasResults && (
+        {debouncedQuery && hasResults && (
           <>
+            {isLoading && (
+              <p className="text-sm text-[#94A3B8]">
+                A complementar resultados...
+              </p>
+            )}
             <ArtistsSection artists={results.artists} />
             <TracksSection
               tracks={results.tracks}

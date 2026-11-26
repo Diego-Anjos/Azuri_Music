@@ -1,11 +1,14 @@
-# Environment / secrets (Spotify keys, etc.)
+# Environment / secrets (Spotify, Gemini, etc.) — nunca commitar chaves
 .env
+*.env
+server/.env
 .env.local
 .env.development
 .env.production
 .env.*.local
 .env.*
 !.env.example
+!server/.env.example
 *.local
 
 # Dependencies
@@ -18,8 +21,10 @@ server/dist/
 build/
 .output/
 .vite/
+server/cache/
 .turbo
 .next
+*.tsbuildinfo
 
 # Logs
 logs/

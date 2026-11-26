@@ -131,10 +131,141 @@ function clampSearchLimit(limit: number): number {
   return Math.min(Math.max(1, Number(limit) || 10), 10)
 }
 
+const TOKEN_STORAGE_KEY = 'azuri_spotify_token'
+const SEARCH_CACHE_TTL_MS = 10 * 60 * 1000
+const SEARCH_TRACKS_CACHE_PREFIX = 'azuri_sp_tracks:'
+const SEARCH_CATALOG_CACHE_PREFIX = 'azuri_sp_catalog:'
+const SPOTIFY_COOLDOWN_MS = 45_000
+
+/** Token único em memória (espelhado em sessionStorage). */
+let cachedAccessToken: string | null = null
+let cachedExpiresAt = 0
 /** Evita N tokens em paralelo quando Promise.all dispara várias buscas. */
 let inFlightTokenPromise: Promise<string> | null = null
+/** Circuit breaker: pausa todas as chamadas à api.spotify.com após 429. */
+let spotifyCooldownUntil = 0
+
+export function isSpotifyCoolingDown(): boolean {
+  return Date.now() < spotifyCooldownUntil
+}
+
+function tripSpotifyCooldown(retryAfterHeader?: string | null) {
+  let pauseMs = SPOTIFY_COOLDOWN_MS
+  if (retryAfterHeader) {
+    const seconds = Number(retryAfterHeader)
+    if (Number.isFinite(seconds) && seconds > 0) {
+      pauseMs = Math.max(pauseMs, Math.round(seconds * 1000))
+    }
+  }
+  spotifyCooldownUntil = Date.now() + pauseMs
+  console.warn(
+    `Spotify 429 — cooldown até ${new Date(spotifyCooldownUntil).toISOString()}`,
+  )
+}
+
+function normalizeQueryKey(query: string): string {
+  return query.trim().toLowerCase().replace(/\s+/g, ' ')
+}
+
+type PersistedToken = { accessToken: string; expiresAt: number }
+
+function readPersistedToken(): PersistedToken | null {
+  try {
+    const raw = sessionStorage.getItem(TOKEN_STORAGE_KEY)
+    if (!raw) return null
+    const parsed = JSON.parse(raw) as Partial<PersistedToken>
+    if (
+      typeof parsed.accessToken !== 'string' ||
+      typeof parsed.expiresAt !== 'number'
+    ) {
+      return null
+    }
+    return { accessToken: parsed.accessToken, expiresAt: parsed.expiresAt }
+  } catch {
+    return null
+  }
+}
+
+function persistToken(accessToken: string, expiresAt: number) {
+  cachedAccessToken = accessToken
+  cachedExpiresAt = expiresAt
+  try {
+    sessionStorage.setItem(
+      TOKEN_STORAGE_KEY,
+      JSON.stringify({ accessToken, expiresAt } satisfies PersistedToken),
+    )
+  } catch {
+    // ignore quota / private mode
+  }
+}
+
+type TimedCachePayload<T> = { savedAt: number; data: T }
+
+function readTimedCache<T>(key: string, ttlMs: number): T | null {
+  try {
+    const raw = sessionStorage.getItem(key)
+    if (!raw) return null
+    const parsed = JSON.parse(raw) as TimedCachePayload<T>
+    if (!parsed || typeof parsed.savedAt !== 'number') return null
+    if (Date.now() - parsed.savedAt > ttlMs) {
+      sessionStorage.removeItem(key)
+      return null
+    }
+    return parsed.data
+  } catch {
+    return null
+  }
+}
+
+function writeTimedCache<T>(key: string, data: T) {
+  try {
+    const payload: TimedCachePayload<T> = { savedAt: Date.now(), data }
+    sessionStorage.setItem(key, JSON.stringify(payload))
+  } catch {
+    // ignore
+  }
+}
+
+/**
+ * Fetch para api.spotify.com com circuit breaker 429.
+ * Retorna null quando em cooldown ou após trip 429 (sem prolongar o bloqueio).
+ */
+async function spotifyApiFetch(
+  url: string,
+  init?: RequestInit,
+): Promise<Response | null> {
+  if (isSpotifyCoolingDown()) {
+    return null
+  }
+
+  const response = await fetch(url, init)
+
+  if (response.status === 429) {
+    tripSpotifyCooldown(response.headers.get('Retry-After'))
+    return null
+  }
+
+  return response
+}
 
 async function getAccessToken(): Promise<string> {
+  if (isSpotifyCoolingDown()) {
+    throw new Error('Spotify em cooldown (429)')
+  }
+
+  const now = Date.now()
+
+  if (cachedAccessToken && now < cachedExpiresAt) {
+    return cachedAccessToken
+  }
+
+  const persisted = readPersistedToken()
+  if (persisted && now < persisted.expiresAt) {
+    cachedAccessToken = persisted.accessToken
+    cachedExpiresAt = persisted.expiresAt
+    return persisted.accessToken
+  }
+
   if (inFlightTokenPromise) return inFlightTokenPromise
 
   inFlightTokenPromise = (async () => {
@@ -156,6 +287,11 @@ async function getAccessToken(): Promise<string> {
       body: 'grant_type=client_credentials',
     })
 
+    if (response.status === 429) {
+      tripSpotifyCooldown(response.headers.get('Retry-After'))
+      throw new Error('Spotify token 429 — cooldown ativo')
+    }
+
     if (!response.ok) {
       const errorBody = await response.text()
       console.error(
@@ -166,6 +302,9 @@ async function getAccessToken(): Promise<string> {
     }
 
     const data = (await response.json()) as SpotifyTokenResponse
+    // Renova 60s antes do expires_in oficial
+    const expiresAt = Date.now() + Math.max(30, data.expires_in - 60) * 1000
+    persistToken(data.access_token, expiresAt)
     console.log('Token Spotify gerado com sucesso!')
     return data.access_token
   })().finally(() => {
@@ -212,15 +351,19 @@ export async function searchPlaylistsByQuery(
   limit: number = 6,
 ): Promise<SpotifyPlaylist[]> {
   try {
+    if (isSpotifyCoolingDown()) return []
+
     const token = await getAccessToken()
     const safeLimit = clampSearchLimit(limit)
     const url = `https://api.spotify.com/v1/search?q=${encodeURIComponent(query)}&type=playlist&limit=${safeLimit}`
 
-    const response = await fetch(url, {
+    const response = await spotifyApiFetch(url, {
       headers: {
         Authorization: 'Bearer ' + token,
       },
     })
+
+    if (!response) return []
 
     if (!response.ok) {
       const errorBody = await response.text()
@@ -245,16 +388,27 @@ export async function searchTracksByQuery(
   query: string,
   limit = 10,
 ): Promise<SpotifyTrack[]> {
+  const normalized = normalizeQueryKey(query)
+  if (!normalized) return []
+
+  const cacheKey = `${SEARCH_TRACKS_CACHE_PREFIX}${normalized}|${clampSearchLimit(limit)}`
+  const cached = readTimedCache<SpotifyTrack[]>(cacheKey, SEARCH_CACHE_TTL_MS)
+  if (cached) return cached
+
   try {
+    if (isSpotifyCoolingDown()) return []
+
     const token = await getAccessToken()
     const safeLimit = clampSearchLimit(limit)
     const url = `https://api.spotify.com/v1/search?q=${encodeURIComponent(query)}&type=track&limit=${safeLimit}`
 
-    const response = await fetch(url, {
+    const response = await spotifyApiFetch(url, {
       headers: {
         Authorization: 'Bearer ' + token,
       },
     })
+
+    if (!response) return []
 
     if (!response.ok) {
       const errorBody = await response.text()
@@ -264,7 +418,7 @@ export async function searchTracksByQuery(
 
     const data = (await response.json()) as SpotifyCatalogApiResponse
 
-    return (data.tracks?.items ?? [])
+    const tracks = (data.tracks?.items ?? [])
       .filter(
         (item): item is NonNullable<typeof item> =>
           item != null && Boolean(item.id) && Boolean(item.name),
@@ -288,6 +442,9 @@ export async function searchTracksByQuery(
           durationMs: item.duration_ms,
         }
       })
+
+    writeTimedCache(cacheKey, tracks)
+    return tracks
   } catch (error) {
     console.error('Erro ao buscar faixas relacionadas:', error)
     return []
@@ -349,11 +506,15 @@ async function searchTracksByQueryRaw(
   limit: number,
   offset: number = 0,
 ): Promise<NonNullable<NonNullable<SpotifyCatalogApiResponse['tracks']>['items']>> {
+  if (isSpotifyCoolingDown()) return []
+
   const safeLimit = clampSearchLimit(limit)
   const url = `https://api.spotify.com/v1/search?q=${encodeURIComponent(query)}&type=track&limit=${safeLimit}&offset=${offset}`
-  const response = await fetch(url, {
+  const response = await spotifyApiFetch(url, {
     headers: { Authorization: 'Bearer ' + token },
   })
+
+  if (!response) return []
 
   if (!response.ok) {
     const errorBody = await response.text()
@@ -516,13 +677,15 @@ async function fetchSpotifyArtistAlbums(
   const albums: SpotifyAlbumItem[] = []
   const seen = new Set<string>()
 
+  if (isSpotifyCoolingDown()) return albums
+
   // 1) Discografia oficial quando o ID Spotify é válido
   try {
-    const res = await fetch(
+    const res = await spotifyApiFetch(
       `https://api.spotify.com/v1/artists/${artistId}/albums?include_groups=album,single&limit=50&market=US`,
       { headers },
     )
-    if (res.ok) {
+    if (res?.ok) {
       const data = (await res.json()) as SpotifyAlbumsApiPayload
       for (const album of data.items ?? []) {
         if (!album?.id || !album.name || seen.has(album.id)) continue
@@ -534,13 +697,15 @@ async function fetchSpotifyArtistAlbums(
     console.warn('Falha albums por artistId:', error)
   }
 
+  if (isSpotifyCoolingDown()) return albums
+
   // 2) Complemento via search type=album
   try {
-    const res = await fetch(
+    const res = await spotifyApiFetch(
       `https://api.spotify.com/v1/search?q=${encodeURIComponent(artistName.trim())}&type=album&limit=${clampSearchLimit(10)}`,
       { headers },
     )
-    if (res.ok) {
+    if (res?.ok) {
       const data = (await res.json()) as SpotifyArtistSearchApiPayload
       for (const album of data.albums?.items ?? []) {
         if (!album?.id || !album.name || seen.has(album.id)) continue
@@ -639,15 +804,35 @@ export async function getAllArtistTracks(
 export async function searchCatalog(
   query: string,
 ): Promise<SpotifyCatalogSearchResult> {
+  const empty: SpotifyCatalogSearchResult = {
+    tracks: [],
+    artists: [],
+    playlists: [],
+  }
+
+  const normalized = normalizeQueryKey(query)
+  if (!normalized) return empty
+
+  const cacheKey = `${SEARCH_CATALOG_CACHE_PREFIX}${normalized}`
+  const cached = readTimedCache<SpotifyCatalogSearchResult>(
+    cacheKey,
+    SEARCH_CACHE_TTL_MS,
+  )
+  if (cached) return cached
+
   try {
+    if (isSpotifyCoolingDown()) return empty
+
     const token = await getAccessToken()
     const url = `https://api.spotify.com/v1/search?q=${encodeURIComponent(query)}&type=artist,track&limit=10`
 
-    const response = await fetch(url, {
+    const response = await spotifyApiFetch(url, {
       headers: {
         Authorization: 'Bearer ' + token,
       },
     })
+
+    if (!response) return empty
 
     if (!response.ok) {
       const errorBody = await response.text()
@@ -714,14 +899,16 @@ export async function searchCatalog(
       }
     }
 
-    return {
+    const result: SpotifyCatalogSearchResult = {
       tracks,
       artists,
       playlists: [],
     }
+    writeTimedCache(cacheKey, result)
+    return result
   } catch (error) {
     console.error('Erro na pesquisa oficial do Spotify:', error)
-    return { tracks: [], artists: [], playlists: [] }
+    return empty
   }
 }
 
@@ -737,11 +924,15 @@ async function fetchPlaylistItems(
 
   for (const url of endpoints) {
     try {
-      const response = await fetch(url, {
+      if (isSpotifyCoolingDown()) return { total: 0, items: [] }
+
+      const response = await spotifyApiFetch(url, {
         headers: {
           Authorization: 'Bearer ' + token,
         },
       })
+
+      if (!response) return { total: 0, items: [] }
 
       if (!response.ok) {
         const errorBody = await response.text()
@@ -1033,10 +1224,14 @@ async function fetchTracksFromDiscography(
   const pages = await Promise.all(
     selected.map(async (album) => {
       try {
-        const response = await fetch(
+        if (isSpotifyCoolingDown()) return [] as ArtistProfileTrack[]
+
+        const response = await spotifyApiFetch(
           `https://api.spotify.com/v1/albums/${album.id}/tracks?limit=50`,
           { headers: { Authorization: `Bearer ${token}` } },
         )
+
+        if (!response) return [] as ArtistProfileTrack[]
 
         if (!response.ok) {
           const errorBody = await response.text()
@@ -1099,29 +1294,31 @@ export async function getArtistProfile(
     let artistData: SpotifyArtistApiPayload | null = null
 
     // 1. Tentar buscar pelo ID direto
-    const artistRes = await fetch(
+    const artistRes = await spotifyApiFetch(
       `https://api.spotify.com/v1/artists/${id}`,
       { headers },
     )
 
-    if (artistRes.ok) {
+    if (artistRes?.ok) {
       artistData = (await artistRes.json()) as SpotifyArtistApiPayload
-    } else if (artistName?.trim()) {
+    } else if (artistName?.trim() && !isSpotifyCoolingDown()) {
       // 2. Fallback: se o ID falhar (ex.: mock), pesquisar pelo nome
-      const searchRes = await fetch(
+      const searchRes = await spotifyApiFetch(
         `https://api.spotify.com/v1/search?q=${encodeURIComponent(artistName.trim())}&type=artist&limit=1`,
         { headers },
       )
-      const searchData =
-        (await searchRes.json()) as SpotifyArtistSearchApiPayload
-      const found = (searchData.artists?.items ?? []).find(
-        (item): item is SpotifyArtistApiPayload =>
-          item != null && Boolean(item.id) && Boolean(item.name),
-      )
+      if (searchRes?.ok) {
+        const searchData =
+          (await searchRes.json()) as SpotifyArtistSearchApiPayload
+        const found = (searchData.artists?.items ?? []).find(
+          (item): item is SpotifyArtistApiPayload =>
+            item != null && Boolean(item.id) && Boolean(item.name),
+        )
 
-      if (found) {
-        artistData = found
-        artistId = found.id
+        if (found) {
+          artistData = found
+          artistId = found.id
+        }
       }
     }
 
@@ -1154,10 +1351,12 @@ export async function getArtistProfile(
         await Promise.all([
           searchCatalog(artistQuery),
           fetchArtistMeta(artistQuery),
-          fetch(
-            `https://api.spotify.com/v1/search?q=${encodeURIComponent(artistQuery)}&type=album&limit=10`,
-            { headers: { Authorization: 'Bearer ' + token } },
-          ),
+          isSpotifyCoolingDown()
+            ? Promise.resolve(null)
+            : spotifyApiFetch(
+                `https://api.spotify.com/v1/search?q=${encodeURIComponent(artistQuery)}&type=album&limit=10`,
+                { headers: { Authorization: 'Bearer ' + token } },
+              ),
           searchTracksByQueryRaw(token, `artist:"${artistQuery}"`, 10, 0),
         ])
 
@@ -1187,10 +1386,10 @@ export async function getArtistProfile(
         ),
       )
 
-      if (!searchAlbumsRes.ok) {
+      if (searchAlbumsRes && !searchAlbumsRes.ok) {
         const err = await searchAlbumsRes.json()
         console.error('Erro Spotify albums:', JSON.stringify(err))
-      } else {
+      } else if (searchAlbumsRes?.ok) {
         const aData = (await searchAlbumsRes.json()) as SpotifyArtistSearchApiPayload
         const uniqueAlbums = Array.from(
           new Map(
@@ -1273,9 +1472,11 @@ export async function getPlaylistDetails(
   playlistId: string,
 ): Promise<SpotifyPlaylistDetails | null> {
   try {
+    if (isSpotifyCoolingDown()) return null
+
     const token = await getAccessToken()
 
-    const response = await fetch(
+    const response = await spotifyApiFetch(
       `https://api.spotify.com/v1/playlists/${playlistId}?market=US`,
       {
         headers: {
@@ -1283,6 +1484,8 @@ export async function getPlaylistDetails(
         },
       },
     )
+
+    if (!response) return null
 
     if (!response.ok) {
       const errorBody = await response.text()
@@ -1328,11 +1531,14 @@ export async function getPlaylistDetails(
 
 export async function getAlbumDetails(id: string) {
   try {
+    if (isSpotifyCoolingDown()) return null
+
     const token = await getAccessToken()
-    const res = await fetch(`https://api.spotify.com/v1/albums/${id}`, {
+    const res = await spotifyApiFetch(`https://api.spotify.com/v1/albums/${id}`, {
       headers: { Authorization: `Bearer ${token}` },
     })
 
+    if (!res) return null
     if (!res.ok) throw new Error('Falha ao buscar álbum no Spotify')
 
     const data = await res.json()
