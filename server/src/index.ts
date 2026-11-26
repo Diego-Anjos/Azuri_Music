@@ -1,11 +1,56 @@
+import { spawn } from 'node:child_process'
+import { existsSync, readFileSync } from 'node:fs'
+import { dirname, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import cors from 'cors'
 import express from 'express'
 import play from 'play-dl'
+import { handleAiLyricsSync } from './aiLyricsSync.js'
+import {
+  buildSearchVariants,
+  cleanLyricsArtist,
+  cleanLyricsTitle,
+  durationClose,
+  isArtistMatch,
+  isValidLyricsText,
+  tokenSimilarity,
+  type LyricsSearchVariant,
+} from './utils/lyricsNormalizer.js'
+
+/** Carrega server/.env sem dependência extra (não sobrescreve env já definida). */
+function loadServerEnv() {
+  const candidates = [
+    resolve(process.cwd(), '.env'),
+    resolve(dirname(fileURLToPath(import.meta.url)), '../.env'),
+  ]
+  for (const filePath of candidates) {
+    if (!existsSync(filePath)) continue
+    for (const line of readFileSync(filePath, 'utf8').split(/\r?\n/)) {
+      const trimmed = line.trim()
+      if (!trimmed || trimmed.startsWith('#')) continue
+      const eq = trimmed.indexOf('=')
+      if (eq <= 0) continue
+      const key = trimmed.slice(0, eq).trim()
+      let value = trimmed.slice(eq + 1).trim()
+      if (
+        (value.startsWith('"') && value.endsWith('"')) ||
+        (value.startsWith("'") && value.endsWith("'"))
+      ) {
+        value = value.slice(1, -1)
+      }
+      if (!(key in process.env)) process.env[key] = value
+    }
+    break
+  }
+}
+
+loadServerEnv()
 
 const app = express()
 const PORT = Number(process.env.PORT) || 3001
 
 app.use(cors())
+app.use(express.json({ limit: '2mb' }))
 
 const SC_HEADERS = {
   'User-Agent':
@@ -212,8 +257,10 @@ function extractArtistMetaFromHtml(
 }
 
 type SoundCloudApiUser = {
+  id?: number
   username?: string
   permalink_url?: string
+  avatar_url?: string | null
   followers_count?: number
   track_count?: number
   city?: string | null
@@ -222,6 +269,28 @@ type SoundCloudApiUser = {
   visuals?: {
     visuals?: Array<{ visual_url?: string | null } | null> | null
   } | null
+}
+
+type SoundCloudApiTrack = {
+  id?: number
+  title?: string
+  duration?: number
+  artwork_url?: string | null
+  permalink_url?: string | null
+  user?: {
+    id?: number
+    username?: string
+    avatar_url?: string | null
+  } | null
+}
+
+type ArtistTrackPayload = {
+  id: string
+  name: string
+  artistName: string
+  durationMs: number
+  artworkUrl: string | null
+  permalinkUrl: string | null
 }
 
 let cachedClientId: string | null = null
@@ -406,7 +475,236 @@ async function resolveArtistMeta(name: string): Promise<ArtistMetaPayload> {
   return { ...EMPTY_ARTIST_META }
 }
 
-app.get('/api/stream', async (req, res) => {
+type StreamQuality = 'low' | 'medium' | 'high' | 'ultra'
+
+function parseStreamQuality(value: unknown): StreamQuality {
+  if (
+    value === 'low' ||
+    value === 'medium' ||
+    value === 'high' ||
+    value === 'ultra'
+  ) {
+    return value
+  }
+  return 'high'
+}
+
+/** Seleção de bitrate via yt-dlp (abr ≈ kbps). */
+function qualityToYtDlpFormat(quality: StreamQuality): string {
+  switch (quality) {
+    case 'low':
+      return 'bestaudio[abr<=96]/bestaudio[abr<=128]/bestaudio'
+    case 'medium':
+      return 'bestaudio[abr<=160]/bestaudio'
+    case 'ultra':
+      return 'bestaudio/best'
+    case 'high':
+    default:
+      return 'bestaudio[abr<=256]/bestaudio'
+  }
+}
+
+function guessMimeFromUrl(url: string): string {
+  if (/mime=audio%2Fwebm|mime=audio\/webm|\.webm/i.test(url)) {
+    return 'audio/webm'
+  }
+  if (/mime=audio%2Fmp4|mime=audio\/mp4|\.m4a|\.mp4/i.test(url)) {
+    return 'audio/mp4'
+  }
+  if (/\.ogg/i.test(url)) return 'audio/ogg'
+  return 'audio/webm'
+}
+
+function setStreamCorsHeaders(res: express.Response) {
+  res.setHeader('Access-Control-Allow-Origin', '*')
+  res.setHeader('Access-Control-Allow-Methods', 'GET,HEAD,OPTIONS')
+  res.setHeader(
+    'Access-Control-Allow-Headers',
+    'Range, Content-Type, Accept, Origin',
+  )
+  res.setHeader(
+    'Access-Control-Expose-Headers',
+    'Accept-Ranges, Content-Length, Content-Range, Content-Type',
+  )
+  res.setHeader('Accept-Ranges', 'bytes')
+  res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin')
+}
+
+async function resolveYoutubeResult(query: string) {
+  const results = await play.search(query.trim(), {
+    limit: 1,
+    source: { youtube: 'video' },
+  })
+  const firstResult = Array.isArray(results) ? results[0] : undefined
+  if (!firstResult?.id) return null
+  return {
+    videoId: firstResult.id,
+    title: firstResult.title,
+    url: `https://www.youtube.com/watch?v=${firstResult.id}`,
+  }
+}
+
+/** Resolve URL direta de áudio com yt-dlp (play-dl cipher está quebrado no YT atual). */
+function resolveDirectAudioUrl(
+  videoUrl: string,
+  quality: StreamQuality,
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const args = [
+      '-m',
+      'yt_dlp',
+      '-f',
+      qualityToYtDlpFormat(quality),
+      '-g',
+      '--no-playlist',
+      '--no-warnings',
+      videoUrl,
+    ]
+
+    const child = spawn('python', args, {
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+
+    let stdout = ''
+    let stderr = ''
+
+    child.stdout.on('data', (chunk: Buffer) => {
+      stdout += chunk.toString('utf8')
+    })
+    child.stderr.on('data', (chunk: Buffer) => {
+      stderr += chunk.toString('utf8')
+    })
+    child.on('error', (error) => reject(error))
+    child.on('close', (code) => {
+      const url = stdout
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .find((line) => /^https?:\/\//i.test(line))
+
+      if (url) {
+        resolve(url)
+        return
+      }
+
+      reject(
+        new Error(
+          `yt-dlp falhou (code=${code}): ${stderr.trim() || 'sem URL'}`,
+        ),
+      )
+    })
+  })
+}
+
+async function proxyAudioFromUrl(
+  req: express.Request,
+  res: express.Response,
+  sourceUrl: string,
+) {
+  const headers: Record<string, string> = {
+    'User-Agent':
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    Accept: '*/*',
+  }
+
+  if (typeof req.headers.range === 'string' && req.headers.range) {
+    headers.Range = req.headers.range
+  }
+
+  const upstream = await fetch(sourceUrl, { headers })
+
+  if (!upstream.ok && upstream.status !== 206) {
+    throw new Error(`Upstream HTTP ${upstream.status}`)
+  }
+
+  setStreamCorsHeaders(res)
+  res.status(upstream.status)
+
+  const contentType =
+    upstream.headers.get('content-type') || guessMimeFromUrl(sourceUrl)
+  res.setHeader('Content-Type', contentType)
+  res.setHeader('Cache-Control', 'no-store')
+  res.setHeader('Accept-Ranges', 'bytes')
+
+  const contentLength = upstream.headers.get('content-length')
+  if (contentLength) res.setHeader('Content-Length', contentLength)
+
+  const contentRange = upstream.headers.get('content-range')
+  if (contentRange) res.setHeader('Content-Range', contentRange)
+
+  if (req.method === 'HEAD' || !upstream.body) {
+    res.end()
+    return
+  }
+
+  const reader = upstream.body.getReader()
+  let cancelled = false
+
+  req.on('close', () => {
+    cancelled = true
+    void reader.cancel().catch(() => undefined)
+  })
+
+  try {
+    while (!cancelled) {
+      const { done, value } = await reader.read()
+      if (done) break
+      if (!value) continue
+      if (!res.write(Buffer.from(value))) {
+        await new Promise<void>((resolve) => res.once('drain', resolve))
+      }
+    }
+    res.end()
+  } catch (error) {
+    console.error('Erro ao proxyar áudio:', error)
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Falha ao transmitir áudio' })
+    } else {
+      res.end()
+    }
+  }
+}
+
+/** Resolve metadados JSON (fallback YouTube / embeds). */
+app.get('/api/stream/resolve', async (req, res) => {
+  try {
+    const query = req.query.query
+    if (!query || typeof query !== 'string' || !query.trim()) {
+      res.status(400).json({ error: 'Parâmetro query é obrigatório' })
+      return
+    }
+
+    const quality = parseStreamQuality(req.query.quality)
+    const resolved = await resolveYoutubeResult(query)
+    if (!resolved) {
+      res.status(404).json({ error: 'Vídeo não encontrado' })
+      return
+    }
+
+    setStreamCorsHeaders(res)
+    res.json({
+      videoId: resolved.videoId,
+      title: resolved.title,
+      quality,
+      streamUrl: `/api/stream?query=${encodeURIComponent(query.trim())}&quality=${quality}`,
+    })
+  } catch (error) {
+    console.error('Erro ao resolver stream:', error)
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Falha ao resolver vídeo' })
+    }
+  }
+})
+
+/**
+ * Proxy de áudio com CORS liberado para Web Audio API.
+ * quality: low | medium | high | ultra → prioriza menor/maior bitrate (yt-dlp).
+ * ?resolve=1 mantém compatibilidade com clientes que esperam JSON { videoId }.
+ */
+async function handleStreamRequest(
+  req: express.Request,
+  res: express.Response,
+) {
   try {
     const query = req.query.query
 
@@ -415,28 +713,53 @@ app.get('/api/stream', async (req, res) => {
       return
     }
 
-    const results = await play.search(query.trim(), {
-      limit: 1,
-      source: { youtube: 'video' },
-    })
+    const quality = parseStreamQuality(req.query.quality)
+    const wantsJson =
+      req.query.resolve === '1' ||
+      req.query.format === 'json' ||
+      (typeof req.headers.accept === 'string' &&
+        req.headers.accept.includes('application/json') &&
+        !req.headers.accept.includes('audio/'))
 
-    const firstResult = Array.isArray(results) ? results[0] : undefined
-
-    if (!firstResult?.id) {
+    const resolved = await resolveYoutubeResult(query)
+    if (!resolved) {
       res.status(404).json({ error: 'Vídeo não encontrado' })
       return
     }
 
-    res.json({
-      videoId: firstResult.id,
-      title: firstResult.title,
-    })
+    if (wantsJson) {
+      setStreamCorsHeaders(res)
+      res.json({
+        videoId: resolved.videoId,
+        title: resolved.title,
+        quality,
+        streamUrl: `/api/stream?query=${encodeURIComponent(query.trim())}&quality=${quality}`,
+      })
+      return
+    }
+
+    const directUrl = await resolveDirectAudioUrl(resolved.url, quality)
+    await proxyAudioFromUrl(req, res, directUrl)
   } catch (error) {
     console.error('Erro detalhado:', error)
     if (!res.headersSent) {
-      res.status(500).json({ error: 'Falha ao resolver vídeo' })
+      setStreamCorsHeaders(res)
+      res.status(500).json({ error: 'Falha ao resolver stream de áudio' })
     }
   }
+}
+
+app.get('/api/stream', handleStreamRequest)
+app.head('/api/stream', handleStreamRequest)
+
+app.options('/api/stream', (_req, res) => {
+  setStreamCorsHeaders(res)
+  res.status(204).end()
+})
+
+app.options('/api/stream/resolve', (_req, res) => {
+  setStreamCorsHeaders(res)
+  res.status(204).end()
 })
 
 async function handleArtistMetaRequest(
@@ -465,14 +788,194 @@ app.get('/api/artist-meta', handleArtistMetaRequest)
 /** Compatibilidade: mesma resposta rica (clientes antigos usam só bannerUrl). */
 app.get('/api/artist-banner', handleArtistMetaRequest)
 
+function upgradeSoundCloudArtwork(url: string | null | undefined): string | null {
+  if (!url || typeof url !== 'string') return null
+  let cleaned = url.trim()
+  if (/^http:\/\//i.test(cleaned)) {
+    cleaned = cleaned.replace(/^http:/i, 'https:')
+  }
+  if (!/^https:\/\//i.test(cleaned)) return null
+  if (/default_avatar|placeholder/i.test(cleaned)) return null
+  return cleaned
+    .replace('-large.', '-t500x500.')
+    .replace('-t67x67.', '-t500x500.')
+    .replace('-badge.', '-t500x500.')
+}
+
+/** Resolve o utilizador SoundCloud (com id) pela mesma cascata do artist-meta. */
+async function resolveSoundCloudUser(
+  name: string,
+): Promise<SoundCloudApiUser | null> {
+  const clientId = await getSoundCloudClientId()
+  if (clientId) {
+    try {
+      const url = `https://api-v2.soundcloud.com/search/users?q=${encodeURIComponent(name.trim())}&client_id=${clientId}&limit=5&app_locale=pt`
+      const response = await fetch(url, { headers: SC_HEADERS })
+      if (response.ok) {
+        const data = (await response.json()) as {
+          collection?: SoundCloudApiUser[] | null
+        }
+        const best = pickBestUser(data.collection ?? [], name)
+        if (best?.id) return best
+      }
+    } catch (error) {
+      console.error('Falha ao resolver user SoundCloud via API:', error)
+    }
+  }
+
+  // Fallback: perfil por slug → extrair id do HTML
+  try {
+    const slug = slugifyArtistName(name)
+    if (!slug) return null
+    const permalink = `https://soundcloud.com/${slug}`
+    const html = await fetchHtml(permalink)
+    if (!html) return null
+    const idMatch = html.match(/"id"\s*:\s*(\d{5,})/)
+    const username =
+      extractJsonString(html, 'username') || name.trim()
+    if (!idMatch?.[1]) return null
+    return {
+      id: Number(idMatch[1]),
+      username,
+      permalink_url: permalink,
+      avatar_url: extractJsonString(html, 'avatar_url'),
+      track_count: extractJsonNumber(html, 'track_count') ?? 0,
+    }
+  } catch (error) {
+    console.error('Falha ao resolver user SoundCloud via slug:', error)
+    return null
+  }
+}
+
+async function fetchAllSoundCloudUserTracks(
+  userId: number,
+  clientId: string,
+  artistNameFallback: string,
+  avatarFallback: string | null,
+): Promise<ArtistTrackPayload[]> {
+  const tracks: ArtistTrackPayload[] = []
+  const seen = new Set<string>()
+  let offset = 0
+  const limit = 50
+  const maxPages = 8
+
+  for (let page = 0; page < maxPages; page++) {
+    const url = `https://api-v2.soundcloud.com/users/${userId}/tracks?client_id=${clientId}&limit=${limit}&offset=${offset}&linked_partitioning=1`
+    const response = await fetch(url, { headers: SC_HEADERS })
+    if (!response.ok) break
+
+    const data = (await response.json()) as {
+      collection?: SoundCloudApiTrack[] | null
+      next_href?: string | null
+    }
+
+    const batch = data.collection ?? []
+    if (batch.length === 0) break
+
+    for (const item of batch) {
+      if (!item?.id || !item.title?.trim()) continue
+      const id = `sc-${item.id}`
+      if (seen.has(id)) continue
+      seen.add(id)
+
+      const artwork =
+        upgradeSoundCloudArtwork(item.artwork_url) ||
+        upgradeSoundCloudArtwork(item.user?.avatar_url) ||
+        upgradeSoundCloudArtwork(avatarFallback)
+
+      tracks.push({
+        id,
+        name: item.title.trim(),
+        artistName:
+          item.user?.username?.trim() || artistNameFallback || 'Artista',
+        durationMs: typeof item.duration === 'number' ? item.duration : 0,
+        artworkUrl: artwork,
+        permalinkUrl: item.permalink_url?.split('?')[0] ?? null,
+      })
+    }
+
+    if (batch.length < limit && !data.next_href) break
+    offset += limit
+  }
+
+  return tracks
+}
+
+async function handleArtistTracksRequest(
+  req: express.Request,
+  res: express.Response,
+) {
+  try {
+    const name = req.query.name
+
+    if (!name || typeof name !== 'string' || !name.trim()) {
+      res.status(200).json({ tracks: [], total: 0 })
+      return
+    }
+
+    const user = await resolveSoundCloudUser(name.trim())
+    if (!user?.id) {
+      res.status(200).json({ tracks: [], total: 0 })
+      return
+    }
+
+    const clientId = await getSoundCloudClientId()
+    if (!clientId) {
+      res.status(200).json({ tracks: [], total: 0 })
+      return
+    }
+
+    const tracks = await fetchAllSoundCloudUserTracks(
+      user.id,
+      clientId,
+      user.username || name.trim(),
+      user.avatar_url ?? null,
+    )
+
+    res.status(200).json({
+      tracks,
+      total: tracks.length,
+    })
+  } catch (error) {
+    console.error('Erro ao buscar faixas SoundCloud:', error)
+    res.status(200).json({ tracks: [], total: 0 })
+  }
+}
+
+/** Catálogo público de faixas do artista no SoundCloud. */
+app.get('/api/artist-tracks', handleArtistTracksRequest)
+
 /* -------------------------------------------------------------------------- */
-/*  Agregador Multi-Fontes de Letras                                           */
+/*  Agregador Multi-Fontes de Letras (cascata + cache)                         */
 /* -------------------------------------------------------------------------- */
 
 type LyricsAggregateResult = {
   syncedLyrics: string | null
   plainLyrics: string | null
   source: string
+  found?: boolean
+}
+
+type LyricsCandidate = {
+  id: string
+  title: string
+  artist: string
+  duration: number | null
+  hasSynced: boolean
+  source: 'lrclib' | 'genius'
+  url: string | null
+}
+
+type LrclibHit = {
+  id?: number
+  name?: string
+  trackName?: string
+  artistName?: string
+  albumName?: string
+  duration?: number
+  syncedLyrics?: string | null
+  plainLyrics?: string | null
+  instrumental?: boolean
 }
 
 const LYRICS_HEADERS = {
@@ -482,57 +985,91 @@ const LYRICS_HEADERS = {
   'Accept-Language': 'en-US,en;q=0.9',
 }
 
-function cleanLyricsTitle(title: string): string {
-  return title
-    // Barras / e | → espaços (ex: Answers/Make Sense → Answers Make Sense)
-    .replace(/[\/|｜]/g, ' ')
-    .replace(
-      /\s*[([{]?\s*(feat\.?|ft\.?|featuring|prod\.?|produced by)\s+[^)\]}]*[)\]}]?/gi,
-      '',
-    )
-    .replace(
-      /\s*[([{][^)\]}]*(official|audio|video|lyric|visuali[sz]er|remaster(?:ed)?|radio edit|explicit|clean)[^)\]}]*[)\]}]/gi,
-      '',
-    )
-    .replace(/\s*[-–—]\s*(official|lyric|audio|video).*$/i, '')
-    // Remove parênteses/colchetes restantes (conteúdo incluído)
-    .replace(/[([{][^)\]}]*[)\]}]/g, ' ')
-    .replace(/[([{}\])]/g, ' ')
-    .replace(/\s{2,}/g, ' ')
-    .trim()
+const LRCLIB_HEADERS = {
+  ...LYRICS_HEADERS,
+  'Lrclib-Client': 'Azuri Music/1.0 (https://github.com)',
 }
 
-/** Variantes de título para cascata (completo limpo + 1ª parte antes de / ou |). */
-function buildLyricsTitleVariants(rawTitle: string): string[] {
-  const variants: string[] = []
-  const seen = new Set<string>()
+const lyricsMemoryCache = new Map<
+  string,
+  { at: number; payload: LyricsAggregateResult }
+>()
+const LYRICS_CACHE_TTL_MS = 1000 * 60 * 45
+const LYRICS_MEMORY_CACHE_VERSION = 'v2'
 
-  const push = (value: string) => {
-    const cleaned = cleanLyricsTitle(value)
-    if (!cleaned) return
-    const key = cleaned.toLowerCase()
-    if (seen.has(key)) return
-    seen.add(key)
-    variants.push(cleaned)
-  }
+// Descarta entradas antigas em memória ao recarregar o servidor
+lyricsMemoryCache.clear()
 
-  push(rawTitle)
-
-  // Se o original tinha barra/pipe, tentar só a primeira parte
-  const firstSegment = rawTitle.split(/[\/|｜]/)[0]?.trim()
-  if (firstSegment && firstSegment.toLowerCase() !== rawTitle.trim().toLowerCase()) {
-    push(firstSegment)
-  }
-
-  return variants
+function lyricsCacheKey(
+  title: string,
+  artist: string,
+  duration: number | null,
+): string {
+  return `${LYRICS_MEMORY_CACHE_VERSION}|${artist.toLowerCase()}|${title.toLowerCase()}|${duration ?? 0}`
 }
 
-function primaryLyricsArtist(artistName: string): string {
-  return (
-    artistName
-      .split(/\s*(?:,|&| feat\.?| ft\.?| featuring)\s+/i)[0]
-      ?.trim() || artistName.trim()
-  )
+function getCachedLyrics(
+  title: string,
+  artist: string,
+  duration: number | null,
+): LyricsAggregateResult | null {
+  const key = lyricsCacheKey(title, artist, duration)
+  const hit = lyricsMemoryCache.get(key)
+  if (!hit) return null
+  if (Date.now() - hit.at > LYRICS_CACHE_TTL_MS) {
+    lyricsMemoryCache.delete(key)
+    return null
+  }
+  return hit.payload
+}
+
+function setCachedLyrics(
+  title: string,
+  artist: string,
+  duration: number | null,
+  payload: LyricsAggregateResult,
+) {
+  lyricsMemoryCache.set(lyricsCacheKey(title, artist, duration), {
+    at: Date.now(),
+    payload,
+  })
+}
+
+/** Só aceita resultados com artista compatível, duração próxima e texto limpo. */
+function gateLyricsResult(
+  result: LyricsAggregateResult | null,
+  options: {
+    expectedArtist: string
+    candidateArtist?: string | null
+    candidateDuration?: number | null
+    targetDuration?: number | null
+    requireArtist?: boolean
+  },
+): LyricsAggregateResult | null {
+  if (!result) return null
+
+  const requireArtist = options.requireArtist !== false
+  if (requireArtist && options.expectedArtist.trim()) {
+    if (!options.candidateArtist?.trim()) return null
+    if (!isArtistMatch(options.expectedArtist, options.candidateArtist)) {
+      return null
+    }
+  }
+
+  if (
+    options.candidateDuration != null &&
+    options.candidateDuration > 0 &&
+    options.targetDuration != null &&
+    options.targetDuration > 0 &&
+    !durationClose(options.candidateDuration, options.targetDuration, 15)
+  ) {
+    return null
+  }
+
+  const text = (result.syncedLyrics || result.plainLyrics || '').trim()
+  if (text && !isValidLyricsText(text)) return null
+
+  return result
 }
 
 function stripHtmlToText(html: string): string {
@@ -553,6 +1090,55 @@ function stripHtmlToText(html: string): string {
     .trim()
 }
 
+/**
+ * Remove só o cabeçalho Order: de cyphers + nomes curtos seguintes.
+ * Para no primeiro marcador [Verse]/[Intro]/[Chorus]/[Refrão]…
+ * ou na primeira linha com 4+ palavras — o resto da música fica intacto.
+ */
+function stripCypherOrderBlock(text: string): string {
+  const lines = text.split(/\r?\n/)
+  let start = 0
+  while (start < lines.length && !lines[start].trim()) start++
+  if (start >= lines.length) return text
+
+  const header = lines[start].trim()
+  if (!/^(?:verse\s+)?order\s*:|^ordem\s*:/i.test(header)) return text
+
+  let i = start + 1
+  while (i < lines.length) {
+    const line = lines[i].trim()
+    if (!line) {
+      i++
+      continue
+    }
+
+    // Qualquer marcador entre colchetes encerra o bloco Order:
+    if (line.startsWith('[')) break
+
+    const words = line.split(/\s+/).filter(Boolean)
+    // Primeira linha com 4+ palavras = início do verso real
+    if (words.length >= 4) break
+
+    // Nomes curtos do cabeçalho de ordem (1–3 palavras)
+    if (
+      words.length >= 1 &&
+      words.length <= 3 &&
+      line.length <= 40 &&
+      !/[.!?,"]/.test(line)
+    ) {
+      i++
+      continue
+    }
+
+    break
+  }
+
+  return [...lines.slice(0, start), ...lines.slice(i)]
+    .join('\n')
+    .replace(/^\n+/, '')
+    .trim()
+}
+
 function countNonEmptyLines(text: string): number {
   return text
     .split(/\r?\n/)
@@ -560,170 +1146,342 @@ function countNonEmptyLines(text: string): number {
     .filter(Boolean).length
 }
 
-/** Fonte 1 — LRCLIB /api/search (nunca /api/get). */
-async function fetchFromLrclib(
-  cleanTitle: string,
-  primaryArtist: string,
-): Promise<LyricsAggregateResult | null> {
-  try {
-    const q = `${cleanTitle} ${primaryArtist}`
-    const url = `https://lrclib.net/api/search?q=${encodeURIComponent(q)}`
-    const res = await fetch(url, {
-      headers: {
-        ...LYRICS_HEADERS,
-        'Lrclib-Client': 'Azuri Music/1.0 (https://github.com)',
-      },
-    })
-    if (!res.ok) return null
-
-    const results = (await res.json()) as Array<{
-      syncedLyrics?: string | null
-      plainLyrics?: string | null
-      instrumental?: boolean
-    }>
-
-    if (!Array.isArray(results) || results.length === 0) return null
-
-    const withSynced = results.find((r) => r.syncedLyrics?.trim())
-    if (withSynced?.syncedLyrics?.trim()) {
-      return {
-        syncedLyrics: withSynced.syncedLyrics.trim(),
-        plainLyrics: withSynced.plainLyrics?.trim() || null,
-        source: 'lrclib',
-      }
-    }
-
-    const withPlain = results.find((r) => r.plainLyrics?.trim())
-    if (withPlain?.plainLyrics?.trim()) {
-      return {
-        syncedLyrics: null,
-        plainLyrics: withPlain.plainLyrics.trim(),
-        source: 'lrclib',
-      }
-    }
-
-    if (results.some((r) => r.instrumental)) {
-      return {
-        syncedLyrics: null,
-        plainLyrics: '♪ Instrumental ♪',
-        source: 'lrclib',
-      }
-    }
-
-    return null
-  } catch (error) {
-    console.error('LRCLIB search falhou:', error)
-    return null
-  }
+/** Texto limpo precisa ter ≥3 linhas não vazias para contar como letra válida. */
+function hasEnoughLyricLines(result: {
+  syncedLyrics?: string | null
+  plainLyrics?: string | null
+}): boolean {
+  const text = (result.syncedLyrics || result.plainLyrics || '').trim()
+  return countNonEmptyLines(text) >= 3
 }
 
-/** Fonte 2 — Lyrics.ovh */
-async function fetchFromLyricsOvh(
-  cleanTitle: string,
-  primaryArtist: string,
+function parseDurationQuery(value: unknown): number | null {
+  if (typeof value === 'string' && value.trim()) {
+    const n = Number(value)
+    return Number.isFinite(n) && n > 0 ? Math.round(n) : null
+  }
+  if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+    return Math.round(value)
+  }
+  return null
+}
+
+/** Camada 1 — LRCLIB /api/get (match exato com duração). */
+async function fetchLrclibExact(
+  title: string,
+  artist: string,
+  durationSec: number | null,
 ): Promise<LyricsAggregateResult | null> {
-  try {
-    const url = `https://api.lyrics.ovh/v1/${encodeURIComponent(primaryArtist)}/${encodeURIComponent(cleanTitle)}`
-    const res = await fetch(url, { headers: LYRICS_HEADERS })
-    if (!res.ok) return null
+  if (!title || !artist) return null
 
-    const data = (await res.json()) as { lyrics?: string }
-    const lyrics = data.lyrics?.trim()
-    if (!lyrics) return null
+  const durationsToTry =
+    durationSec && durationSec > 0
+      ? [
+          durationSec,
+          durationSec - 1,
+          durationSec + 1,
+          durationSec - 2,
+          durationSec + 2,
+          durationSec - 3,
+          durationSec + 3,
+          durationSec - 4,
+          durationSec + 4,
+          durationSec - 5,
+          durationSec + 5,
+        ].filter((d) => d > 0)
+      : [null]
 
+  for (const duration of durationsToTry) {
+    try {
+      const params = new URLSearchParams({
+        track_name: title,
+        artist_name: artist,
+      })
+      if (duration != null) params.set('duration', String(duration))
+
+      const res = await fetch(`https://lrclib.net/api/get?${params}`, {
+        headers: LRCLIB_HEADERS,
+      })
+      if (!res.ok) continue
+
+      const data = (await res.json()) as LrclibHit
+      if (data.syncedLyrics?.trim()) {
+        return {
+          syncedLyrics: data.syncedLyrics.trim(),
+          plainLyrics: data.plainLyrics?.trim() || null,
+          source: 'lrclib-synced',
+          found: true,
+        }
+      }
+      if (data.plainLyrics?.trim()) {
+        return {
+          syncedLyrics: null,
+          plainLyrics: data.plainLyrics.trim(),
+          source: 'lrclib',
+          found: true,
+        }
+      }
+      if (data.instrumental) {
+        return {
+          syncedLyrics: null,
+          plainLyrics: '♪ Instrumental ♪',
+          source: 'lrclib',
+          found: true,
+        }
+      }
+    } catch (error) {
+      console.error('LRCLIB get falhou:', error)
+    }
+  }
+
+  return null
+}
+
+function scoreLrclibHit(
+  hit: LrclibHit,
+  variant: LyricsSearchVariant,
+  durationSec: number | null,
+): number {
+  const hitTitle = hit.trackName || hit.name || ''
+  const hitArtist = hit.artistName || ''
+  const titleScore = tokenSimilarity(hitTitle, variant.title)
+  const artistScore = variant.artist
+    ? tokenSimilarity(hitArtist, variant.artist)
+    : 0
+  const durationBonus = durationClose(hit.duration, durationSec, 15) ? 0.15 : -0.4
+  const syncedBonus = hit.syncedLyrics?.trim() ? 0.2 : 0
+  return titleScore * 0.45 + artistScore * 0.4 + durationBonus + syncedBonus
+}
+
+function lrclibHitToResult(hit: LrclibHit): LyricsAggregateResult | null {
+  if (hit.syncedLyrics?.trim()) {
+    return {
+      syncedLyrics: hit.syncedLyrics.trim(),
+      plainLyrics: hit.plainLyrics?.trim() || null,
+      source: 'lrclib-synced',
+      found: true,
+    }
+  }
+  if (hit.plainLyrics?.trim()) {
     return {
       syncedLyrics: null,
-      plainLyrics: lyrics.replace(/\r\n/g, '\n').trim(),
-      source: 'lyrics.ovh',
+      plainLyrics: hit.plainLyrics.trim(),
+      source: 'lrclib',
+      found: true,
     }
-  } catch (error) {
-    console.error('Lyrics.ovh falhou:', error)
-    return null
   }
+  if (hit.instrumental) {
+    return {
+      syncedLyrics: null,
+      plainLyrics: '♪ Instrumental ♪',
+      source: 'lrclib',
+      found: true,
+    }
+  }
+  return null
 }
 
-/** Fonte 3 — Genius search + scrape limpo dos containers de letra. */
-async function fetchFromGenius(
-  cleanTitle: string,
-  primaryArtist: string,
+/** Camada 2 — LRCLIB /api/search fuzzy (exige artista compatível). */
+async function fetchLrclibFuzzy(
+  variants: LyricsSearchVariant[],
+  expectedArtist: string,
+  durationSec: number | null,
 ): Promise<LyricsAggregateResult | null> {
-  try {
-    const q = `${cleanTitle} ${primaryArtist}`
-    const searchUrl = `https://genius.com/api/search/multi?q=${encodeURIComponent(q)}`
-    const searchRes = await fetch(searchUrl, { headers: LYRICS_HEADERS })
-    if (!searchRes.ok) return null
+  let best: { hit: LrclibHit; score: number } | null = null
 
-    const searchData = (await searchRes.json()) as {
-      response?: {
-        sections?: Array<{
-          type?: string
-          hits?: Array<{
-            type?: string
-            result?: { url?: string; title?: string }
-          }>
-        }>
+  const queries = new Set<string>()
+  for (const variant of variants) {
+    if (variant.artist && variant.query) queries.add(variant.query)
+  }
+
+  for (const q of queries) {
+    try {
+      const url = `https://lrclib.net/api/search?q=${encodeURIComponent(q)}`
+      const res = await fetch(url, { headers: LRCLIB_HEADERS })
+      if (!res.ok) continue
+
+      const results = (await res.json()) as LrclibHit[]
+      if (!Array.isArray(results)) continue
+
+      for (const hit of results) {
+        const variant =
+          variants.find((v) => v.query === q) ??
+          variants[0]
+        if (!variant?.artist) continue
+
+        const hitArtist = hit.artistName || ''
+        if (!isArtistMatch(expectedArtist || variant.artist, hitArtist)) continue
+
+        const titleOk =
+          tokenSimilarity(hit.trackName || hit.name || '', variant.title) >= 0.4
+        if (!titleOk) continue
+        if (!durationClose(hit.duration, durationSec, 15)) continue
+
+        const score = scoreLrclibHit(hit, variant, durationSec)
+        if (!best || score > best.score) best = { hit, score }
       }
+    } catch (error) {
+      console.error('LRCLIB search falhou:', error)
     }
+  }
 
-    const sections = searchData.response?.sections ?? []
-    let songUrl: string | null = null
+  if (!best || best.score < 0.45) return null
 
-    for (const section of sections) {
-      if (section.type !== 'song' && section.type !== 'top_hit') continue
-      for (const hit of section.hits ?? []) {
-        const url = hit.result?.url
-        if (url && /genius\.com\//i.test(url)) {
-          songUrl = url
-          break
-        }
-      }
-      if (songUrl) break
-    }
+  return gateLyricsResult(lrclibHitToResult(best.hit), {
+    expectedArtist,
+    candidateArtist: best.hit.artistName,
+    candidateDuration: best.hit.duration,
+    targetDuration: durationSec,
+  })
+}
 
-    // Fallback: qualquer hit com URL de música
-    if (!songUrl) {
-      for (const section of sections) {
-        for (const hit of section.hits ?? []) {
-          const url = hit.result?.url
-          if (url && /genius\.com\//i.test(url) && hit.type === 'song') {
-            songUrl = url
-            break
-          }
-        }
-        if (songUrl) break
-      }
-    }
+async function scrapeGeniusLyrics(songUrl: string): Promise<string | null> {
+  const pageHtml = await fetchHtml(songUrl)
+  if (!pageHtml) return null
 
-    if (!songUrl) return null
+  const containers = [
+    ...pageHtml.matchAll(
+      /data-lyrics-container="true"[^>]*>([\s\S]*?)<\/div>/gi,
+    ),
+  ]
+  if (containers.length === 0) return null
 
-    const pageHtml = await fetchHtml(songUrl)
-    if (!pageHtml) return null
-
-    const containers = [
-      ...pageHtml.matchAll(
-        /data-lyrics-container="true"[^>]*>([\s\S]*?)<\/div>/gi,
-      ),
-    ]
-
-    if (containers.length === 0) return null
-
-    const plain = containers
+  const plain = stripCypherOrderBlock(
+    containers
       .map((m) => stripHtmlToText(m[1] ?? ''))
       .filter(Boolean)
       .join('\n\n')
-      .trim()
+      .trim(),
+  )
 
-    if (!plain || countNonEmptyLines(plain) < 2) return null
+  if (!plain || countNonEmptyLines(plain) < 3) return null
+  if (!isValidLyricsText(plain)) return null
+  return plain
+}
 
-    return {
-      syncedLyrics: null,
-      plainLyrics: plain,
-      source: 'genius',
-    }
-  } catch (error) {
-    console.error('Genius lyrics falhou:', error)
-    return null
+type GeniusHit = {
+  type?: string
+  result?: {
+    id?: number
+    url?: string
+    title?: string
+    full_title?: string
+    primary_artist?: { name?: string }
   }
+}
+
+async function searchGeniusHits(q: string): Promise<GeniusHit[]> {
+  const searchUrl = `https://genius.com/api/search/multi?per_page=5&q=${encodeURIComponent(q)}`
+  const searchRes = await fetch(searchUrl, { headers: LYRICS_HEADERS })
+  if (!searchRes.ok) return []
+
+  const searchData = (await searchRes.json()) as {
+    response?: {
+      sections?: Array<{
+        type?: string
+        hits?: GeniusHit[]
+      }>
+    }
+  }
+
+  const hits: GeniusHit[] = []
+  for (const section of searchData.response?.sections ?? []) {
+    for (const hit of section.hits ?? []) {
+      if (hit.type === 'song' || section.type === 'song' || section.type === 'top_hit') {
+        hits.push(hit)
+      }
+    }
+  }
+  return hits
+}
+
+/** Camada 3 — Genius search + scrape (exige artista compatível). */
+async function fetchFromGenius(
+  variants: LyricsSearchVariant[],
+  expectedArtist: string,
+): Promise<LyricsAggregateResult | null> {
+  const triedUrls = new Set<string>()
+
+  for (const variant of variants) {
+    if (!variant.artist) continue
+    const q = `${variant.artist} ${variant.title}`
+    if (!q.trim()) continue
+
+    try {
+      const hits = await searchGeniusHits(q)
+      for (const hit of hits) {
+        const result = hit.result
+        const url = result?.url
+        if (!url || !/genius\.com\//i.test(url) || triedUrls.has(url)) continue
+        if (hit.type && hit.type !== 'song') continue
+
+        const hitTitle = result?.title || result?.full_title || ''
+        const hitArtist = result?.primary_artist?.name || ''
+        if (!isArtistMatch(expectedArtist || variant.artist, hitArtist)) continue
+
+        const titleOk = tokenSimilarity(hitTitle, variant.title) >= 0.35
+        if (!titleOk) continue
+
+        triedUrls.add(url)
+        const plain = await scrapeGeniusLyrics(url)
+        if (!plain) continue
+
+        return gateLyricsResult(
+          {
+            syncedLyrics: null,
+            plainLyrics: plain,
+            source: 'genius',
+            found: true,
+          },
+          {
+            expectedArtist,
+            candidateArtist: hitArtist,
+          },
+        )
+      }
+    } catch (error) {
+      console.error('Genius lyrics falhou:', error)
+    }
+  }
+
+  return null
+}
+
+/** Camada 4 — Lyrics.ovh fallback. */
+async function fetchFromLyricsOvh(
+  variants: LyricsSearchVariant[],
+  expectedArtist: string,
+): Promise<LyricsAggregateResult | null> {
+  for (const variant of variants) {
+    if (!variant.title || !variant.artist) continue
+    if (!isArtistMatch(expectedArtist, variant.artist)) continue
+
+    try {
+      const url = `https://api.lyrics.ovh/v1/${encodeURIComponent(variant.artist)}/${encodeURIComponent(variant.title)}`
+      const res = await fetch(url, { headers: LYRICS_HEADERS })
+      if (!res.ok) continue
+
+      const data = (await res.json()) as { lyrics?: string }
+      const lyrics = data.lyrics?.trim()
+      if (!lyrics || !isValidLyricsText(lyrics)) continue
+
+      return gateLyricsResult(
+        {
+          syncedLyrics: null,
+          plainLyrics: lyrics.replace(/\r\n/g, '\n').trim(),
+          source: 'lyrics.ovh',
+          found: true,
+        },
+        {
+          expectedArtist,
+          candidateArtist: variant.artist,
+        },
+      )
+    } catch (error) {
+      console.error('Lyrics.ovh falhou:', error)
+    }
+  }
+  return null
 }
 
 type SoundCloudTrackHit = {
@@ -733,83 +1491,55 @@ type SoundCloudTrackHit = {
   permalink_url?: string
 }
 
-/** Fonte 4 — Description da faixa no SoundCloud (underground). */
+/** Extra — description SoundCloud (só com artista compatível + texto limpo). */
 async function fetchFromSoundCloudDescription(
-  cleanTitle: string,
-  primaryArtist: string,
+  variants: LyricsSearchVariant[],
+  expectedArtist: string,
 ): Promise<LyricsAggregateResult | null> {
-  const q = `${cleanTitle} ${primaryArtist}`
+  for (const variant of variants.slice(0, 3)) {
+    if (!variant.artist) continue
+    const q = variant.query || `${variant.artist} ${variant.title}`
+    if (!q) continue
 
-  try {
-    const clientId = await getSoundCloudClientId()
-    if (clientId) {
-      const apiUrl = `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(q)}&client_id=${clientId}&limit=5&app_locale=en`
-      const apiRes = await fetch(apiUrl, { headers: SC_HEADERS })
-      if (apiRes.ok) {
-        const data = (await apiRes.json()) as {
-          collection?: SoundCloudTrackHit[] | null
-        }
-        for (const track of data.collection ?? []) {
-          const desc = track.description?.trim()
-          if (desc && countNonEmptyLines(desc) > 4) {
-            return {
-              syncedLyrics: null,
-              plainLyrics: desc.replace(/\r\n/g, '\n').trim(),
-              source: 'soundcloud',
+    try {
+      const clientId = await getSoundCloudClientId()
+      if (clientId) {
+        const apiUrl = `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(q)}&client_id=${clientId}&limit=5&app_locale=en`
+        const apiRes = await fetch(apiUrl, { headers: SC_HEADERS })
+        if (apiRes.ok) {
+          const data = (await apiRes.json()) as {
+            collection?: SoundCloudTrackHit[] | null
+          }
+          for (const track of data.collection ?? []) {
+            const trackArtist = track.user?.username || ''
+            if (!isArtistMatch(expectedArtist || variant.artist, trackArtist)) {
+              continue
+            }
+
+            const desc = track.description?.trim()
+            if (
+              desc &&
+              countNonEmptyLines(desc) > 4 &&
+              isValidLyricsText(desc)
+            ) {
+              return gateLyricsResult(
+                {
+                  syncedLyrics: null,
+                  plainLyrics: desc.replace(/\r\n/g, '\n').trim(),
+                  source: 'soundcloud',
+                  found: true,
+                },
+                {
+                  expectedArtist,
+                  candidateArtist: trackArtist,
+                },
+              )
             }
           }
         }
       }
-    }
-  } catch (error) {
-    console.error('SoundCloud API lyrics falhou:', error)
-  }
-
-  // Fallback: HTML da página de pesquisa de sons
-  try {
-    const searchHtml = await fetchHtml(
-      `https://soundcloud.com/search/sounds?q=${encodeURIComponent(q)}`,
-    )
-    if (!searchHtml) return null
-
-    const descriptions = [
-      ...searchHtml.matchAll(
-        /"description"\s*:\s*"((?:\\.|[^"\\])*)"/gi,
-      ),
-    ]
-
-    for (const match of descriptions) {
-      const desc = unescapeJsonString(match[1] ?? '').trim()
-      if (desc && countNonEmptyLines(desc) > 4) {
-        return {
-          syncedLyrics: null,
-          plainLyrics: desc.replace(/\r\n/g, '\n').trim(),
-          source: 'soundcloud',
-        }
-      }
-    }
-  } catch (error) {
-    console.error('SoundCloud HTML lyrics falhou:', error)
-  }
-
-  return null
-}
-
-async function tryAllLyricsSources(
-  cleanTitle: string,
-  primaryArtist: string,
-): Promise<LyricsAggregateResult | null> {
-  const sources: Array<() => Promise<LyricsAggregateResult | null>> = [
-    () => fetchFromLrclib(cleanTitle, primaryArtist),
-    () => fetchFromLyricsOvh(cleanTitle, primaryArtist),
-    () => fetchFromGenius(cleanTitle, primaryArtist),
-    () => fetchFromSoundCloudDescription(cleanTitle, primaryArtist),
-  ]
-
-  for (const run of sources) {
-    const result = await run()
-    if (result?.syncedLyrics || result?.plainLyrics) {
-      return result
+    } catch (error) {
+      console.error('SoundCloud API lyrics falhou:', error)
     }
   }
 
@@ -819,14 +1549,193 @@ async function tryAllLyricsSources(
 async function aggregateLyrics(
   title: string,
   artist: string,
+  durationSec: number | null,
 ): Promise<LyricsAggregateResult | null> {
-  const primaryArtist = primaryLyricsArtist(artist)
-  const titleVariants = buildLyricsTitleVariants(title)
-  if (titleVariants.length === 0 || !primaryArtist) return null
+  const cached = getCachedLyrics(title, artist, durationSec)
+  if (cached) {
+    // Revalida cache antigo em memória (anti-spam / artista)
+    const text = (cached.syncedLyrics || cached.plainLyrics || '').trim()
+    if (text && isValidLyricsText(text)) return cached
+    lyricsMemoryCache.delete(lyricsCacheKey(title, artist, durationSec))
+  }
 
-  for (const cleanTitle of titleVariants) {
-    const result = await tryAllLyricsSources(cleanTitle, primaryArtist)
-    if (result) return result
+  // Busca automática: nunca só pelo título (evita "All Night" → outro artista)
+  const variants = buildSearchVariants(title, artist).filter((v) => v.artist)
+  if (variants.length === 0) return null
+
+  const expectedArtist = cleanLyricsArtist(artist) || variants[0].artist
+  const primary = variants[0]
+
+  // Camada 1 — LRCLIB exato
+  if (primary?.artist) {
+    const exact = await fetchLrclibExact(
+      primary.title,
+      primary.artist,
+      durationSec,
+    )
+    const gatedExact = gateLyricsResult(exact, {
+      expectedArtist,
+      candidateArtist: primary.artist,
+      targetDuration: durationSec,
+      requireArtist: true,
+    })
+    if (gatedExact) {
+      setCachedLyrics(title, artist, durationSec, gatedExact)
+      return gatedExact
+    }
+  }
+
+  // Camada 2 — LRCLIB fuzzy
+  const fuzzy = await fetchLrclibFuzzy(variants, expectedArtist, durationSec)
+  if (fuzzy) {
+    setCachedLyrics(title, artist, durationSec, fuzzy)
+    return fuzzy
+  }
+
+  // Camada 3 — Genius
+  const genius = await fetchFromGenius(variants, expectedArtist)
+  if (genius) {
+    setCachedLyrics(title, artist, durationSec, genius)
+    return genius
+  }
+
+  // Camada 4 — Lyrics.ovh
+  const ovh = await fetchFromLyricsOvh(variants, expectedArtist)
+  if (ovh) {
+    setCachedLyrics(title, artist, durationSec, ovh)
+    return ovh
+  }
+
+  // Extra underground
+  const sc = await fetchFromSoundCloudDescription(variants, expectedArtist)
+  if (sc) {
+    setCachedLyrics(title, artist, durationSec, sc)
+    return sc
+  }
+
+  return null
+}
+
+async function collectLyricsCandidates(q: string): Promise<LyricsCandidate[]> {
+  const query = q.trim()
+  if (!query) return []
+
+  const candidates: LyricsCandidate[] = []
+  const seen = new Set<string>()
+
+  const push = (candidate: LyricsCandidate) => {
+    const key = `${candidate.source}:${candidate.id || candidate.url || candidate.title}`
+    if (seen.has(key)) return
+    seen.add(key)
+    candidates.push(candidate)
+  }
+
+  try {
+    const lrclibRes = await fetch(
+      `https://lrclib.net/api/search?q=${encodeURIComponent(query)}`,
+      { headers: LRCLIB_HEADERS },
+    )
+    if (lrclibRes.ok) {
+      const results = (await lrclibRes.json()) as LrclibHit[]
+      for (const hit of results.slice(0, 6)) {
+        push({
+          id: String(hit.id ?? `${hit.artistName}-${hit.trackName}`),
+          title: hit.trackName || hit.name || 'Sem título',
+          artist: hit.artistName || 'Artista desconhecido',
+          duration: typeof hit.duration === 'number' ? hit.duration : null,
+          hasSynced: Boolean(hit.syncedLyrics?.trim()),
+          source: 'lrclib',
+          url: null,
+        })
+      }
+    }
+  } catch (error) {
+    console.error('LRCLIB candidates falhou:', error)
+  }
+
+  try {
+    const hits = await searchGeniusHits(query)
+    for (const hit of hits.slice(0, 6)) {
+      const result = hit.result
+      if (!result?.url || hit.type === 'artist') continue
+      push({
+        id: String(result.id ?? result.url),
+        title: result.title || result.full_title || 'Sem título',
+        artist: result.primary_artist?.name || 'Artista desconhecido',
+        duration: null,
+        hasSynced: false,
+        source: 'genius',
+        url: result.url,
+      })
+    }
+  } catch (error) {
+    console.error('Genius candidates falhou:', error)
+  }
+
+  return candidates.slice(0, 8)
+}
+
+async function resolveLyricsCandidate(input: {
+  source?: string
+  id?: string
+  url?: string
+  title?: string
+  artist?: string
+  duration?: number | null
+}): Promise<LyricsAggregateResult | null> {
+  const source = (input.source || '').toLowerCase()
+
+  if (source === 'lrclib' && input.id) {
+    try {
+      const res = await fetch(`https://lrclib.net/api/get?id=${encodeURIComponent(input.id)}`, {
+        headers: LRCLIB_HEADERS,
+      })
+      if (res.ok) {
+        const data = (await res.json()) as LrclibHit
+        if (data.syncedLyrics?.trim()) {
+          return {
+            syncedLyrics: data.syncedLyrics.trim(),
+            plainLyrics: data.plainLyrics?.trim() || null,
+            source: 'lrclib-synced',
+            found: true,
+          }
+        }
+        if (data.plainLyrics?.trim()) {
+          return {
+            syncedLyrics: null,
+            plainLyrics: data.plainLyrics.trim(),
+            source: 'lrclib',
+            found: true,
+          }
+        }
+      }
+    } catch (error) {
+      console.error('Resolve LRCLIB candidate falhou:', error)
+    }
+  }
+
+  if ((source === 'genius' || input.url) && input.url) {
+    try {
+      const plain = await scrapeGeniusLyrics(input.url)
+      if (plain) {
+        return {
+          syncedLyrics: null,
+          plainLyrics: plain,
+          source: 'genius',
+          found: true,
+        }
+      }
+    } catch (error) {
+      console.error('Resolve Genius candidate falhou:', error)
+    }
+  }
+
+  if (input.title && input.artist) {
+    return aggregateLyrics(
+      input.title,
+      input.artist,
+      input.duration ?? null,
+    )
   }
 
   return null
@@ -836,6 +1745,7 @@ const EMPTY_LYRICS_PAYLOAD = {
   syncedLyrics: null as string | null,
   plainLyrics: null as string | null,
   source: null as string | null,
+  found: false as boolean,
 }
 
 app.get('/api/lyrics', async (req, res) => {
@@ -851,7 +1761,6 @@ app.get('/api/lyrics', async (req, res) => {
       typeof artist !== 'string' ||
       !artist.trim()
     ) {
-      // 200 para não poluir o console do browser com 4xx
       res.status(200).json({
         ...EMPTY_LYRICS_PAYLOAD,
         error: 'Parâmetros title e artist são obrigatórios',
@@ -859,22 +1768,80 @@ app.get('/api/lyrics', async (req, res) => {
       return
     }
 
-    // duration é aceite para compatibilidade com o cliente (usado no smart sync frontend)
-    const result = await aggregateLyrics(title.trim(), artist.trim())
+    const duration = parseDurationQuery(req.query.duration)
+    const result = await aggregateLyrics(title.trim(), artist.trim(), duration)
 
-    if (!result) {
+    if (!result || !hasEnoughLyricLines(result)) {
+      res.status(200).json({
+        ...EMPTY_LYRICS_PAYLOAD,
+        cleanedTitle: cleanLyricsTitle(title),
+        cleanedArtist: cleanLyricsArtist(artist),
+      })
+      return
+    }
+
+    res.status(200).json({ ...result, found: true })
+  } catch (error) {
+    console.error('Erro no agregador de letras:', error)
+    res.status(200).json({ ...EMPTY_LYRICS_PAYLOAD })
+  }
+})
+
+app.get('/api/lyrics/search', async (req, res) => {
+  try {
+    const q = req.query.q
+    if (!q || typeof q !== 'string' || !q.trim()) {
+      res.status(200).json({ candidates: [] })
+      return
+    }
+
+    const candidates = await collectLyricsCandidates(q.trim())
+    res.status(200).json({ candidates })
+  } catch (error) {
+    console.error('Erro em /api/lyrics/search:', error)
+    res.status(200).json({ candidates: [] })
+  }
+})
+
+app.get('/api/lyrics/candidate', async (req, res) => {
+  try {
+    const source =
+      typeof req.query.source === 'string' ? req.query.source : undefined
+    const id = typeof req.query.id === 'string' ? req.query.id : undefined
+    const url = typeof req.query.url === 'string' ? req.query.url : undefined
+    const title =
+      typeof req.query.title === 'string' ? req.query.title : undefined
+    const artist =
+      typeof req.query.artist === 'string' ? req.query.artist : undefined
+    const duration = parseDurationQuery(req.query.duration)
+
+    const result = await resolveLyricsCandidate({
+      source,
+      id,
+      url,
+      title,
+      artist,
+      duration,
+    })
+
+    if (!result || !hasEnoughLyricLines(result)) {
       res.status(200).json({ ...EMPTY_LYRICS_PAYLOAD })
       return
     }
 
-    res.status(200).json(result)
+    res.status(200).json({ ...result, found: true })
   } catch (error) {
-    console.error('Erro no agregador de letras:', error)
-    // Mantém 200 + nulls para o frontend tratar silenciosamente
+    console.error('Erro em /api/lyrics/candidate:', error)
     res.status(200).json({ ...EMPTY_LYRICS_PAYLOAD })
   }
+})
+
+/** Alinhamento áudio↔letra via Gemini 2.5 Flash (fallback seguro se sem API key). */
+app.post('/api/lyrics/ai-sync', (req, res) => {
+  void handleAiLyricsSync(req, res)
 })
 
 app.listen(PORT, () => {
   console.log(`Azuri resolve server em http://localhost:${PORT}`)
 })
+

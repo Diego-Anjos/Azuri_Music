@@ -24,6 +24,10 @@ import { AzuriToast } from './AzuriToast'
 import { ShareModal } from './ShareModal'
 import { TrackWaveform } from './TrackWaveform'
 import {
+  isTrackLiked,
+  toggleLikedTrack,
+} from '../services/libraryStorage'
+import {
   usePlayerStore,
   type PlayerTrack,
 } from '../store/usePlayerStore'
@@ -72,10 +76,6 @@ function commentsStorageKey(trackId: string) {
   return `azuri_comments_${trackId}`
 }
 
-function likedStorageKey(trackId: string) {
-  return `azuri_liked_${trackId}`
-}
-
 function loadComments(trackId: string): TrackComment[] {
   try {
     const raw = localStorage.getItem(commentsStorageKey(trackId))
@@ -89,15 +89,6 @@ function loadComments(trackId: string): TrackComment[] {
 
 function saveComments(trackId: string, comments: TrackComment[]) {
   localStorage.setItem(commentsStorageKey(trackId), JSON.stringify(comments))
-}
-
-function loadLiked(trackId: string) {
-  return localStorage.getItem(likedStorageKey(trackId)) === '1'
-}
-
-function saveLiked(trackId: string, liked: boolean) {
-  if (liked) localStorage.setItem(likedStorageKey(trackId), '1')
-  else localStorage.removeItem(likedStorageKey(trackId))
 }
 
 const actionBtnClass =
@@ -117,7 +108,7 @@ export function TrackRow({
   const currentTrack = usePlayerStore((s) => s.currentTrack)
   const progress = usePlayerStore((s) => s.progress)
 
-  const [liked, setLiked] = useState(() => loadLiked(track.id))
+  const [liked, setLiked] = useState(() => isTrackLiked(track.id))
   const [commentsOpen, setCommentsOpen] = useState(false)
   const [comments, setComments] = useState<TrackComment[]>(() =>
     loadComments(track.id),
@@ -147,7 +138,7 @@ export function TrackRow({
       : ''
 
   useEffect(() => {
-    setLiked(loadLiked(track.id))
+    setLiked(isTrackLiked(track.id))
     setComments(loadComments(track.id))
     setCommentsOpen(false)
     setCommentDraft('')
@@ -188,11 +179,7 @@ export function TrackRow({
 
   function toggleLike(event: MouseEvent) {
     event.stopPropagation()
-    setLiked((prev) => {
-      const next = !prev
-      saveLiked(track.id, next)
-      return next
-    })
+    setLiked(toggleLikedTrack(track))
   }
 
   function toggleComments(event: MouseEvent) {
@@ -344,7 +331,7 @@ export function TrackRow({
               className={`${actionBtnClass} ${
                 liked
                   ? 'text-cyan-400 opacity-100'
-                  : 'opacity-0 group-hover:opacity-100'
+                  : 'opacity-100 sm:opacity-0 sm:group-hover:opacity-100'
               }`}
               onClick={toggleLike}
               aria-label={liked ? 'Remover curtida' : 'Curtir faixa'}
@@ -358,7 +345,7 @@ export function TrackRow({
 
             <button
               type="button"
-              className={`${actionBtnClass} flex items-center opacity-0 group-hover:opacity-100 ${
+              className={`${actionBtnClass} hidden items-center opacity-0 group-hover:opacity-100 sm:flex ${
                 commentsOpen ? 'text-cyan-400 opacity-100' : ''
               }`}
               onClick={toggleComments}
@@ -373,7 +360,7 @@ export function TrackRow({
 
             <button
               type="button"
-              className={`${actionBtnClass} opacity-0 group-hover:opacity-100 ${
+              className={`${actionBtnClass} hidden opacity-0 group-hover:opacity-100 sm:flex ${
                 shareOpen ? 'text-cyan-400 opacity-100' : ''
               }`}
               onClick={handleShare}
@@ -382,7 +369,7 @@ export function TrackRow({
               <Share2 className="h-4 w-4" strokeWidth={ICON_STROKE} />
             </button>
 
-            <div className="relative" ref={menuRef}>
+            <div className="relative hidden sm:block" ref={menuRef}>
               <button
                 type="button"
                 className={`${actionBtnClass} opacity-0 group-hover:opacity-100 ${
@@ -460,17 +447,19 @@ export function TrackRow({
         </div>
       </div>
 
-      {/* WAVEFORM */}
-      <TrackWaveform
-        trackId={track.id}
-        trackName={track.name}
-        durationMs={track.duration_ms ?? 0}
-        barCount={65}
-        variant={isCompact ? 'compact' : 'featured'}
-        className={
-          isCompact ? 'mt-1.5 h-4 pl-10' : 'mt-3 h-10 pl-[3.25rem]'
-        }
-      />
+      {/* WAVEFORM — oculta no mobile */}
+      <div className="hidden sm:block">
+        <TrackWaveform
+          trackId={track.id}
+          trackName={track.name}
+          durationMs={track.duration_ms ?? 0}
+          barCount={65}
+          variant={isCompact ? 'compact' : 'featured'}
+          className={
+            isCompact ? 'mt-1.5 h-4 pl-10' : 'mt-3 h-10 pl-[3.25rem]'
+          }
+        />
+      </div>
 
       {/* GAVETA DE COMENTÁRIOS */}
       {commentsOpen && (

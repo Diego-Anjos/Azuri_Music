@@ -126,37 +126,53 @@ interface SpotifyCatalogApiResponse {
   } | null
 }
 
+/** /v1/search rejeita limit fora de 1–10 neste client. */
+function clampSearchLimit(limit: number): number {
+  return Math.min(Math.max(1, Number(limit) || 10), 10)
+}
+
+/** Evita N tokens em paralelo quando Promise.all dispara várias buscas. */
+let inFlightTokenPromise: Promise<string> | null = null
+
 async function getAccessToken(): Promise<string> {
-  const clientId = import.meta.env.VITE_SPOTIFY_CLIENT_ID
-  const clientSecret = import.meta.env.VITE_SPOTIFY_CLIENT_SECRET
+  if (inFlightTokenPromise) return inFlightTokenPromise
 
-  if (!clientId || !clientSecret) {
-    console.error('Credenciais do Spotify ausentes no .env')
-    throw new Error('Credenciais do Spotify ausentes no .env')
-  }
+  inFlightTokenPromise = (async () => {
+    const clientId = import.meta.env.VITE_SPOTIFY_CLIENT_ID
+    const clientSecret = import.meta.env.VITE_SPOTIFY_CLIENT_SECRET
 
-  // Em dev: Vite proxy /api/token -> https://accounts.spotify.com/api/token (evita CORS)
-  const response = await fetch('/api/token', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/x-www-form-urlencoded',
-      Authorization: 'Basic ' + btoa(clientId + ':' + clientSecret),
-    },
-    body: 'grant_type=client_credentials',
+    if (!clientId || !clientSecret) {
+      console.error('Credenciais do Spotify ausentes no .env')
+      throw new Error('Credenciais do Spotify ausentes no .env')
+    }
+
+    // Em dev: Vite proxy /api/token -> https://accounts.spotify.com/api/token (evita CORS)
+    const response = await fetch('/api/token', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        Authorization: 'Basic ' + btoa(clientId + ':' + clientSecret),
+      },
+      body: 'grant_type=client_credentials',
+    })
+
+    if (!response.ok) {
+      const errorBody = await response.text()
+      console.error(
+        'Credenciais do Spotify ausentes no .env ou inválidas:',
+        errorBody,
+      )
+      throw new Error(`Falha na autenticação Spotify (${response.status})`)
+    }
+
+    const data = (await response.json()) as SpotifyTokenResponse
+    console.log('Token Spotify gerado com sucesso!')
+    return data.access_token
+  })().finally(() => {
+    inFlightTokenPromise = null
   })
 
-  if (!response.ok) {
-    const errorBody = await response.text()
-    console.error(
-      'Credenciais do Spotify ausentes no .env ou inválidas:',
-      errorBody,
-    )
-    throw new Error(`Falha na autenticação Spotify (${response.status})`)
-  }
-
-  const data = (await response.json()) as SpotifyTokenResponse
-  console.log('Token Spotify gerado com sucesso!')
-  return data.access_token
+  return inFlightTokenPromise
 }
 
 function mapPlaylistItems(
@@ -197,7 +213,8 @@ export async function searchPlaylistsByQuery(
 ): Promise<SpotifyPlaylist[]> {
   try {
     const token = await getAccessToken()
-    const url = `https://api.spotify.com/v1/search?q=${encodeURIComponent(query)}&type=playlist&limit=${limit}`
+    const safeLimit = clampSearchLimit(limit)
+    const url = `https://api.spotify.com/v1/search?q=${encodeURIComponent(query)}&type=playlist&limit=${safeLimit}`
 
     const response = await fetch(url, {
       headers: {
@@ -226,11 +243,12 @@ export async function getFeaturedPlaylists(): Promise<SpotifyPlaylist[]> {
 
 export async function searchTracksByQuery(
   query: string,
-  limit = 15,
+  limit = 10,
 ): Promise<SpotifyTrack[]> {
   try {
     const token = await getAccessToken()
-    const url = `https://api.spotify.com/v1/search?q=${encodeURIComponent(query)}&type=track&limit=${Math.min(50, Math.max(1, limit))}`
+    const safeLimit = clampSearchLimit(limit)
+    const url = `https://api.spotify.com/v1/search?q=${encodeURIComponent(query)}&type=track&limit=${safeLimit}`
 
     const response = await fetch(url, {
       headers: {
@@ -282,9 +300,77 @@ export interface ArtistTracksPageResult {
   hasMore: boolean
 }
 
+function trackMatchesArtist(
+  artists: Array<{ id?: string; name?: string }> | null | undefined,
+  artistId: string,
+  artistName: string,
+): boolean {
+  const exactId = artistId?.trim()
+  const nameLower = artistName.trim().toLowerCase()
+
+  return (artists ?? []).some(
+    (a) =>
+      (Boolean(exactId) && a.id === exactId) ||
+      a.name?.toLowerCase() === nameLower,
+  )
+}
+
+function mapSearchItemsToArtistTracks(
+  rawItems: NonNullable<NonNullable<SpotifyCatalogApiResponse['tracks']>['items']>,
+): ArtistProfileTrack[] {
+  return rawItems
+    .filter(
+      (item): item is NonNullable<typeof item> =>
+        item != null && Boolean(item.id) && Boolean(item.name),
+    )
+    .map((item) => ({
+      id: item.id,
+      name: item.name,
+      artists: (item.artists ?? [])
+        .filter((artist) => Boolean(artist.name))
+        .map((artist, index) => ({
+          id: artist.id || `artist-${item.id}-${index}`,
+          name: artist.name,
+        })),
+      album: item.album
+        ? {
+            name: item.album.name,
+            release_date: item.album.release_date,
+            images: item.album.images,
+          }
+        : null,
+      duration_ms: item.duration_ms,
+    }))
+}
+
+async function searchTracksByQueryRaw(
+  token: string,
+  query: string,
+  limit: number,
+  offset: number = 0,
+): Promise<NonNullable<NonNullable<SpotifyCatalogApiResponse['tracks']>['items']>> {
+  const safeLimit = clampSearchLimit(limit)
+  const url = `https://api.spotify.com/v1/search?q=${encodeURIComponent(query)}&type=track&limit=${safeLimit}&offset=${offset}`
+  const response = await fetch(url, {
+    headers: { Authorization: 'Bearer ' + token },
+  })
+
+  if (!response.ok) {
+    const errorBody = await response.text()
+    console.error(errorBody)
+    throw new Error(`Falha na pesquisa de faixas (${response.status})`)
+  }
+
+  const data = (await response.json()) as SpotifyCatalogApiResponse
+  return (data.tracks?.items ?? []).filter(
+    (item): item is NonNullable<typeof item> =>
+      item != null && Boolean(item.id) && Boolean(item.name),
+  )
+}
+
 /**
- * Página de faixas do artista via /v1/search (limit máx. 50, offset ≥ 0).
- * Filtra apenas faixas cujo artista corresponde a artistId/artistName.
+ * Página de faixas do artista via /v1/search (limit máx. 10, offset ≥ 0).
+ * Usa artist:"Nome" + busca simples; filtra por id ou nome exato.
  */
 export async function searchArtistTracksPage(
   artistName: string,
@@ -292,7 +378,7 @@ export async function searchArtistTracksPage(
   offset: number = 0,
   limit: number = 10,
 ): Promise<ArtistTracksPageResult> {
-  const safeLimit = Math.min(50, Math.max(1, limit))
+  const safeLimit = clampSearchLimit(limit)
   const safeOffset = Math.max(0, Math.floor(offset))
   const query = artistName.trim()
 
@@ -302,57 +388,31 @@ export async function searchArtistTracksPage(
 
   try {
     const token = await getAccessToken()
-    const url = `https://api.spotify.com/v1/search?q=${encodeURIComponent(query)}&type=track&limit=${safeLimit}&offset=${safeOffset}`
+    const filterQuery = `artist:"${query}"`
 
-    const response = await fetch(url, {
-      headers: {
-        Authorization: 'Bearer ' + token,
-      },
-    })
-
-    if (!response.ok) {
-      const errorBody = await response.text()
-      console.error(errorBody)
-      throw new Error(`Falha ao paginar faixas do artista (${response.status})`)
-    }
-
-    const data = (await response.json()) as SpotifyCatalogApiResponse
-    const rawItems = (data.tracks?.items ?? []).filter(
-      (item): item is NonNullable<typeof item> =>
-        item != null && Boolean(item.id) && Boolean(item.name),
+    let rawItems = await searchTracksByQueryRaw(
+      token,
+      filterQuery,
+      safeLimit,
+      safeOffset,
     )
 
-    const exactArtistId = artistId?.trim()
-    const artistNameLower = query.toLowerCase()
-
-    const tracks: ArtistProfileTrack[] = rawItems
-      .filter((item) =>
-        (item.artists ?? []).some((a) => {
-          if (a.id && exactArtistId) return a.id === exactArtistId
-          return a.name?.toLowerCase().includes(artistNameLower)
-        }),
+    // Cascata: se o filtro artist: não trouxe página útil, tenta o nome simples
+    if (rawItems.length === 0 && safeOffset === 0) {
+      rawItems = await searchTracksByQueryRaw(
+        token,
+        query,
+        safeLimit,
+        safeOffset,
       )
-      .map((item) => ({
-        id: item.id,
-        name: item.name,
-        artists: (item.artists ?? [])
-          .filter((artist) => Boolean(artist.name))
-          .map((artist, index) => ({
-            id: artist.id || `artist-${item.id}-${index}`,
-            name: artist.name,
-          })),
-        album: item.album
-          ? {
-              name: item.album.name,
-              release_date: item.album.release_date,
-              images: item.album.images,
-            }
-          : null,
-        duration_ms: item.duration_ms,
-      }))
+    }
 
+    const filtered = rawItems.filter((item) =>
+      trackMatchesArtist(item.artists, artistId, query),
+    )
+
+    const tracks = mapSearchItemsToArtistTracks(filtered)
     const nextOffset = safeOffset + safeLimit
-    // Spotify search: há mais resultados se a página veio cheia
     const hasMore = rawItems.length >= safeLimit
 
     return { tracks, nextOffset, hasMore }
@@ -362,12 +422,226 @@ export async function searchArtistTracksPage(
   }
 }
 
+type SoundCloudArtistTrackApi = {
+  id: string
+  name: string
+  artistName: string
+  durationMs: number
+  artworkUrl: string | null
+  permalinkUrl: string | null
+}
+
+export type AllArtistTracksResult = {
+  tracks: ArtistProfileTrack[]
+  total: number
+  soundcloudTotal: number
+}
+
+function normalizeTrackTitle(name: string): string {
+  return name.toLowerCase().trim().replace(/\s+/g, ' ')
+}
+
+function mergeTracksByNormalizedTitle(
+  preferred: ArtistProfileTrack[],
+  extras: ArtistProfileTrack[],
+): ArtistProfileTrack[] {
+  const byTitle = new Map<string, ArtistProfileTrack>()
+  const byId = new Set<string>()
+
+  for (const track of preferred) {
+    if (!track?.id || !track.name) continue
+    byId.add(track.id)
+    const key = normalizeTrackTitle(track.name)
+    if (!byTitle.has(key)) byTitle.set(key, track)
+  }
+
+  for (const track of extras) {
+    if (!track?.id || !track.name) continue
+    if (byId.has(track.id)) continue
+    const key = normalizeTrackTitle(track.name)
+    if (byTitle.has(key)) continue
+    byId.add(track.id)
+    byTitle.set(key, track)
+  }
+
+  return [...byTitle.values()]
+}
+
+async function fetchSoundCloudArtistTracks(
+  artistName: string,
+): Promise<{ tracks: ArtistProfileTrack[]; total: number }> {
+  try {
+    const response = await fetch(
+      `http://localhost:3001/api/artist-tracks?name=${encodeURIComponent(artistName.trim())}`,
+    )
+    if (!response.ok) return { tracks: [], total: 0 }
+
+    const data = (await response.json()) as {
+      tracks?: SoundCloudArtistTrackApi[] | null
+      total?: number
+    }
+
+    const tracks: ArtistProfileTrack[] = (data.tracks ?? [])
+      .filter((item) => Boolean(item?.id) && Boolean(item?.name))
+      .map((item) => ({
+        id: item.id,
+        name: item.name,
+        artists: [{ name: item.artistName || artistName }],
+        duration_ms: item.durationMs || undefined,
+        album: {
+          name: item.name,
+          images: item.artworkUrl ? [{ url: item.artworkUrl }] : null,
+        },
+      }))
+
+    return {
+      tracks,
+      total:
+        typeof data.total === 'number' && data.total > 0
+          ? data.total
+          : tracks.length,
+    }
+  } catch (error) {
+    console.error('Erro ao buscar faixas SoundCloud do artista:', error)
+    return { tracks: [], total: 0 }
+  }
+}
+
+async function fetchSpotifyArtistAlbums(
+  token: string,
+  artistId: string,
+  artistName: string,
+): Promise<SpotifyAlbumItem[]> {
+  const headers = { Authorization: `Bearer ${token}` }
+  const albums: SpotifyAlbumItem[] = []
+  const seen = new Set<string>()
+
+  // 1) Discografia oficial quando o ID Spotify é válido
+  try {
+    const res = await fetch(
+      `https://api.spotify.com/v1/artists/${artistId}/albums?include_groups=album,single&limit=50&market=US`,
+      { headers },
+    )
+    if (res.ok) {
+      const data = (await res.json()) as SpotifyAlbumsApiPayload
+      for (const album of data.items ?? []) {
+        if (!album?.id || !album.name || seen.has(album.id)) continue
+        seen.add(album.id)
+        albums.push(album)
+      }
+    }
+  } catch (error) {
+    console.warn('Falha albums por artistId:', error)
+  }
+
+  // 2) Complemento via search type=album
+  try {
+    const res = await fetch(
+      `https://api.spotify.com/v1/search?q=${encodeURIComponent(artistName.trim())}&type=album&limit=${clampSearchLimit(10)}`,
+      { headers },
+    )
+    if (res.ok) {
+      const data = (await res.json()) as SpotifyArtistSearchApiPayload
+      for (const album of data.albums?.items ?? []) {
+        if (!album?.id || !album.name || seen.has(album.id)) continue
+        if (!trackMatchesArtist(album.artists ?? [], artistId, artistName)) {
+          continue
+        }
+        seen.add(album.id)
+        albums.push(album)
+      }
+    }
+  } catch (error) {
+    console.warn('Falha albums via search:', error)
+  }
+
+  return albums
+}
+
+/**
+ * Catálogo unificado do artista: Spotify (search paginado + discografia)
+ * + SoundCloud (/api/artist-tracks), deduplicado por título normalizado.
+ */
+export async function getAllArtistTracks(
+  artistId: string,
+  artistName: string,
+  options?: { artistImageUrl?: string | null },
+): Promise<AllArtistTracksResult> {
+  const name = artistName.trim()
+  if (!name) {
+    return { tracks: [], total: 0, soundcloudTotal: 0 }
+  }
+
+  try {
+    const token = await getAccessToken()
+    const filterQuery = `artist:"${name}"`
+
+    const [page0, page10, page20, albums, soundcloud] = await Promise.all([
+      searchTracksByQueryRaw(token, filterQuery, 10, 0).catch(() => []),
+      searchTracksByQueryRaw(token, filterQuery, 10, 10).catch(() => []),
+      searchTracksByQueryRaw(token, filterQuery, 10, 20).catch(() => []),
+      fetchSpotifyArtistAlbums(token, artistId, name),
+      fetchSoundCloudArtistTracks(name),
+    ])
+
+    const searchRaw = [...page0, ...page10, ...page20].filter((item) =>
+      trackMatchesArtist(item.artists, artistId, name),
+    )
+    const fromSearch = mapSearchItemsToArtistTracks(searchRaw)
+
+    const fromDiscography = await fetchTracksFromDiscography(
+      token,
+      albums,
+      Math.min(20, Math.max(albums.length, 1)),
+    )
+
+    const spotifyTracks = mergeTracksByNormalizedTitle(
+      fromSearch,
+      fromDiscography.filter((t) =>
+        trackMatchesArtist(t.artists, artistId, name),
+      ),
+    )
+
+    const avatarFallback = options?.artistImageUrl?.trim() || null
+    const soundcloudTracks: ArtistProfileTrack[] = soundcloud.tracks.map(
+      (track) => {
+        const hasCover = Boolean(track.album?.images?.[0]?.url)
+        if (hasCover || !avatarFallback) return track
+        return {
+          ...track,
+          album: {
+            name: track.album?.name ?? track.name,
+            images: [{ url: avatarFallback }],
+          },
+        }
+      },
+    )
+
+    const unified = mergeTracksByNormalizedTitle(
+      spotifyTracks,
+      soundcloudTracks,
+    )
+
+    // Total sincronizado: catálogo unificado vs contagem SoundCloud
+    const total = Math.max(unified.length, soundcloud.total)
+
+    return {
+      tracks: unified,
+      total,
+      soundcloudTotal: soundcloud.total,
+    }
+  } catch (error) {
+    console.error('Erro ao unificar catálogo do artista:', error)
+    return { tracks: [], total: 0, soundcloudTotal: 0 }
+  }
+}
+
 export async function searchCatalog(
   query: string,
 ): Promise<SpotifyCatalogSearchResult> {
   try {
     const token = await getAccessToken()
-    const url = `https://api.spotify.com/v1/search?q=${encodeURIComponent(query)}&type=track,artist,playlist&limit=10`
+    const url = `https://api.spotify.com/v1/search?q=${encodeURIComponent(query)}&type=artist,track&limit=10`
 
     const response = await fetch(url, {
       headers: {
@@ -408,7 +682,7 @@ export async function searchCatalog(
         }
       })
 
-    const artists: SpotifyArtist[] = (data.artists?.items ?? [])
+    let artists: SpotifyArtist[] = (data.artists?.items ?? [])
       .filter(
         (item): item is NonNullable<typeof item> =>
           item != null && Boolean(item.id) && Boolean(item.name),
@@ -419,10 +693,31 @@ export async function searchCatalog(
         imageUrl: item.images?.[0]?.url ?? '',
       }))
 
+    // Fallback: artistas underground podem não vir em artists, mas aparecem em tracks
+    if (artists.length === 0 && tracks.length > 0) {
+      const seen = new Set<string>()
+      artists = []
+
+      for (const item of data.tracks?.items ?? []) {
+        if (!item) continue
+        const coverUrl = item.album?.images?.[0]?.url ?? ''
+
+        for (const artist of item.artists ?? []) {
+          if (!artist.id || !artist.name || seen.has(artist.id)) continue
+          seen.add(artist.id)
+          artists.push({
+            id: artist.id,
+            name: artist.name,
+            imageUrl: coverUrl,
+          })
+        }
+      }
+    }
+
     return {
       tracks,
       artists,
-      playlists: mapPlaylistItems(data.playlists?.items ?? []),
+      playlists: [],
     }
   } catch (error) {
     console.error('Erro na pesquisa oficial do Spotify:', error)
@@ -714,6 +1009,85 @@ async function fetchArtistMeta(
   }
 }
 
+interface SpotifyAlbumTracksApiPayload {
+  items?: Array<{
+    id: string
+    name: string
+    duration_ms?: number
+    artists?: Array<{ id?: string; name: string }>
+  } | null> | null
+}
+
+/** Busca faixas dos primeiros álbuns/singles da discografia (fallback garantido). */
+async function fetchTracksFromDiscography(
+  token: string,
+  albums: SpotifyAlbumItem[],
+  maxAlbums = 5,
+): Promise<ArtistProfileTrack[]> {
+  const selected = albums
+    .filter((album) => Boolean(album?.id) && Boolean(album?.name))
+    .slice(0, maxAlbums)
+
+  if (selected.length === 0) return []
+
+  const pages = await Promise.all(
+    selected.map(async (album) => {
+      try {
+        const response = await fetch(
+          `https://api.spotify.com/v1/albums/${album.id}/tracks?limit=50`,
+          { headers: { Authorization: `Bearer ${token}` } },
+        )
+
+        if (!response.ok) {
+          const errorBody = await response.text()
+          console.warn(
+            `Falha ao buscar faixas do álbum ${album.id}:`,
+            errorBody,
+          )
+          return [] as ArtistProfileTrack[]
+        }
+
+        const data = (await response.json()) as SpotifyAlbumTracksApiPayload
+
+        return (data.items ?? [])
+          .filter(
+            (track): track is NonNullable<typeof track> =>
+              track != null && Boolean(track.id) && Boolean(track.name),
+          )
+          .map((track) => ({
+            id: track.id,
+            name: track.name,
+            artists: (track.artists ?? []).map((a) => ({
+              id: a.id,
+              name: a.name,
+            })),
+            duration_ms: track.duration_ms,
+            album: {
+              id: album.id,
+              name: album.name,
+              release_date: album.release_date,
+              images: album.images ?? null,
+            },
+          }))
+      } catch (error) {
+        console.warn('Erro ao buscar faixas da discografia:', error)
+        return [] as ArtistProfileTrack[]
+      }
+    }),
+  )
+
+  const seen = new Set<string>()
+  const merged: ArtistProfileTrack[] = []
+
+  for (const track of pages.flat()) {
+    if (seen.has(track.id)) continue
+    seen.add(track.id)
+    merged.push(track)
+  }
+
+  return merged
+}
+
 export async function getArtistProfile(
   id: string,
   artistName?: string,
@@ -753,60 +1127,95 @@ export async function getArtistProfile(
 
     if (!artistData) throw new Error('Artista não encontrado no Spotify')
 
-    // 3. ESTRATÉGIA DE BUSCA — reutiliza searchCatalog (mesma URL da página Search)
+    // 3. ESTRATÉGIA DE BUSCA — catalog + artist:"Nome" + discografia
     //    + metadados SoundCloud (banner, seguidores, bio…) via backend Azuri
-    let topTracks: any[] = []
-    let albums: any[] = []
+    let topTracks: ArtistProfileTrack[] = []
+    let albums: SpotifyAlbumItem[] = []
     let artistMeta: ArtistMetaResponse | null = null
 
     try {
       const exactArtistId = artistData.id?.trim()
       const artistQuery = artistData.name.trim()
 
-      const matchesArtist = (artists: Array<{ id?: string; name?: string }> = []) =>
-        artists.some((a) => {
-          if (a.id && exactArtistId) return a.id === exactArtistId
-          return a.name?.toLowerCase().includes(artistData.name.toLowerCase())
-        })
+      const matchesArtist = (
+        artists: Array<{ id?: string; name?: string }> = [],
+      ) => trackMatchesArtist(artists, exactArtistId, artistQuery)
 
-      const [catalog, metaResult, searchAlbumsRes] = await Promise.all([
-        searchCatalog(artistQuery),
-        fetchArtistMeta(artistQuery),
-        fetch(
-          `https://api.spotify.com/v1/search?q=${encodeURIComponent(artistQuery)}&type=album&limit=10`,
-          { headers: { Authorization: 'Bearer ' + token } },
-        ),
-      ])
+      const mergeUniqueTopTracks = (incoming: ArtistProfileTrack[]) => {
+        const seen = new Set(topTracks.map((t) => t.id))
+        for (const track of incoming) {
+          if (!track.id || seen.has(track.id)) continue
+          seen.add(track.id)
+          topTracks.push(track)
+        }
+      }
+
+      const [catalog, metaResult, searchAlbumsRes, artistFilterRaw] =
+        await Promise.all([
+          searchCatalog(artistQuery),
+          fetchArtistMeta(artistQuery),
+          fetch(
+            `https://api.spotify.com/v1/search?q=${encodeURIComponent(artistQuery)}&type=album&limit=10`,
+            { headers: { Authorization: 'Bearer ' + token } },
+          ),
+          searchTracksByQueryRaw(token, `artist:"${artistQuery}"`, 10, 0),
+        ])
 
       artistMeta = metaResult
 
-      topTracks = catalog.tracks
-        .filter((t) => matchesArtist(t.artists))
-        .map((t) => ({
-          id: t.id,
-          name: t.name,
-          artists: t.artists,
-          album: {
-            name: t.albumName,
-            release_date: t.albumReleaseDate,
-            images: t.albumCoverUrl ? [{ url: t.albumCoverUrl }] : null,
-          },
-          duration_ms: t.durationMs,
-        }))
+      mergeUniqueTopTracks(
+        catalog.tracks
+          .filter((t) => matchesArtist(t.artists))
+          .map((t) => ({
+            id: t.id,
+            name: t.name,
+            artists: t.artists,
+            album: {
+              name: t.albumName,
+              release_date: t.albumReleaseDate,
+              images: t.albumCoverUrl ? [{ url: t.albumCoverUrl }] : null,
+            },
+            duration_ms: t.durationMs,
+          })),
+      )
+
+      mergeUniqueTopTracks(
+        mapSearchItemsToArtistTracks(
+          artistFilterRaw.filter((item) =>
+            trackMatchesArtist(item.artists, exactArtistId, artistQuery),
+          ),
+        ),
+      )
 
       if (!searchAlbumsRes.ok) {
         const err = await searchAlbumsRes.json()
         console.error('Erro Spotify albums:', JSON.stringify(err))
       } else {
-        const aData = await searchAlbumsRes.json()
+        const aData = (await searchAlbumsRes.json()) as SpotifyArtistSearchApiPayload
         const uniqueAlbums = Array.from(
           new Map(
             (aData.albums?.items || [])
-              .filter((a: any) => matchesArtist(a.artists))
-              .map((item: any) => [item.name, item]),
+              .filter(
+                (a): a is SpotifyAlbumItem =>
+                  a != null &&
+                  Boolean(a.id) &&
+                  Boolean(a.name) &&
+                  matchesArtist(a.artists ?? []),
+              )
+              .map((item) => [item.name, item]),
           ).values(),
         )
         albums = uniqueAlbums
+      }
+
+      // Fallback obrigatório: discografia → faixas dos singles/álbuns
+      if (topTracks.length === 0 && albums.length > 0) {
+        const fromAlbums = await fetchTracksFromDiscography(
+          token,
+          albums,
+          5,
+        )
+        mergeUniqueTopTracks(fromAlbums)
       }
     } catch (error) {
       console.error('Erro na busca segura do Spotify:', JSON.stringify(error, Object.getOwnPropertyNames(error as object)))

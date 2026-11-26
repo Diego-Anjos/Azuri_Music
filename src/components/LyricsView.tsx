@@ -1,67 +1,92 @@
 import {
   CheckCircle2,
   ChevronDown,
+  Crosshair,
   ExternalLink,
   Mic2,
   Minus,
   Plus,
+  RefreshCw,
+  Search,
+  Sparkles,
 } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
+import { getPlayerAudioElement } from '../contexts/PlayerContext'
 import {
   buildExternalLyricsSearchUrl,
+  cleanTrackTitle,
+  clearLyricsCache,
   fetchLyrics,
-  refreshEstimatedSync,
+  fetchLyricsFromCandidate,
+  getPlainLyricLines,
+  primaryArtistName,
+  readLyricsTiming,
+  recalculateSmartSyncWithAudio,
   saveCustomLrc,
   saveCustomLyrics,
+  searchLyricsCandidates,
+  syncLyricsWithGemini,
+  writeLyricsTiming,
   type LyricLine,
   type LyricsResult,
+  type LyricsSearchCandidate,
 } from '../services/lyricsService'
 import { usePlayerStore } from '../store/usePlayerStore'
 
+type AiSyncUiStatus = 'idle' | 'listening' | 'done' | 'error'
+
 const ICON_STROKE = 1.5
 const OFFSET_STEP = 0.5
-
-function offsetStorageKey(trackId: string) {
-  return `azuri_lyrics_offset_${trackId}`
-}
-
-function readSyncOffset(trackId: string): number {
-  try {
-    const raw = localStorage.getItem(offsetStorageKey(trackId))
-    if (raw == null) return 0
-    const value = Number(raw)
-    return Number.isFinite(value) ? value : 0
-  } catch {
-    return 0
-  }
-}
-
-function writeSyncOffset(trackId: string, offset: number) {
-  try {
-    if (offset === 0) {
-      localStorage.removeItem(offsetStorageKey(trackId))
-    } else {
-      localStorage.setItem(offsetStorageKey(trackId), String(offset))
-    }
-  } catch {
-    /* ignore quota */
-  }
-}
+const OFFSET_FINE_STEP = 0.1
 
 function formatOffsetLabel(offset: number): string {
-  if (Math.abs(offset) < 0.05) return '0.0s'
+  if (Math.abs(offset) < 0.05) return '0.00s'
   const sign = offset > 0 ? '+' : ''
-  return `${sign}${offset.toFixed(1)}s`
+  return `${sign}${offset.toFixed(2)}s`
 }
 
+/** Busca binária — O(log n) para destacar o verso ativo a 60fps. */
 function findActiveLineIndex(lines: LyricLine[], currentTime: number): number {
   if (lines.length === 0) return -1
+  let lo = 0
+  let hi = lines.length - 1
   let active = 0
-  for (let i = 0; i < lines.length; i++) {
-    if (lines[i].time <= currentTime) active = i
-    else break
+
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1
+    if (lines[mid].time <= currentTime) {
+      active = mid
+      lo = mid + 1
+    } else {
+      hi = mid - 1
+    }
   }
+
   return active
+}
+
+function readAudioClock(
+  storeProgress: number,
+  storeDuration: number,
+): { currentTime: number; duration: number } {
+  const audio = getPlayerAudioElement()
+  const audioDuration =
+    audio && Number.isFinite(audio.duration) && audio.duration > 0
+      ? audio.duration
+      : 0
+  const duration =
+    audioDuration > 0
+      ? audioDuration
+      : storeDuration > 0
+        ? storeDuration
+        : 0
+  const currentTime =
+    audio && Number.isFinite(audio.currentTime)
+      ? audio.currentTime
+      : duration > 0
+        ? storeProgress * duration
+        : 0
+  return { currentTime, duration }
 }
 
 export function LyricsView() {
@@ -80,40 +105,52 @@ export function LyricsView() {
   const [tapSyncActive, setTapSyncActive] = useState(false)
   const [tapIndex, setTapIndex] = useState(0)
   const [syncOffset, setSyncOffset] = useState(0)
+  const [manualTitle, setManualTitle] = useState('')
+  const [manualArtist, setManualArtist] = useState('')
+  const [manualSearching, setManualSearching] = useState(false)
+  const [manualLoadingId, setManualLoadingId] = useState<string | null>(null)
+  const [manualCandidates, setManualCandidates] = useState<
+    LyricsSearchCandidate[]
+  >([])
+  const [manualError, setManualError] = useState<string | null>(null)
+  const [activeLineIndex, setActiveLineIndex] = useState(-1)
+  const [clockTime, setClockTime] = useState(0)
+  const [aiSyncStatus, setAiSyncStatus] = useState<AiSyncUiStatus>('idle')
 
   const lineRefs = useRef<(HTMLButtonElement | null)[]>([])
+  const scrollContainerRef = useRef<HTMLDivElement | null>(null)
   const lastActiveRef = useRef(-1)
   const tapIndexRef = useRef(0)
   const tapSyncActiveRef = useRef(false)
   const tappedLinesRef = useRef<LyricLine[]>([])
   const lyricsRef = useRef<LyricsResult | null>(null)
   const currentTimeRef = useRef(0)
+  const syncOffsetRef = useRef(0)
   const trackIdRef = useRef<string | null>(null)
   const lastSmartDurationRef = useRef(0)
+  const autoAiKeyRef = useRef<string | null>(null)
+  const aiSyncInFlightRef = useRef(false)
 
   const coverUrl = currentTrack?.album?.images?.[0]?.url
   const title = currentTrack?.name ?? 'Nenhuma música'
   const artistName =
     currentTrack?.artists?.map((a) => a.name).join(', ') ?? ''
-  const currentTime = duration > 0 ? progress * duration : 0
-  const adjustedTime = currentTime - syncOffset
+  const localAudioUrl = usePlayerStore((s) => s.localAudioUrl)
   const hasLiveSync = Boolean(lyrics?.synced && lyrics.lines.length > 0)
+  const isAiSynced = Boolean(lyrics?.isAiSynced)
   const isExactSync =
     Boolean(lyrics) &&
     !lyrics!.isEstimated &&
-    (lyrics!.source === 'custom-lrc' || lyrics!.source === 'custom')
-
-  // Acompanha currentTime com offset fino por faixa
-  const activeLineIndex = tapSyncActive
-    ? Math.min(tapIndex, Math.max((lyrics?.lines.length ?? 1) - 1, 0))
-    : hasLiveSync
-      ? findActiveLineIndex(lyrics!.lines, adjustedTime)
-      : -1
+    !isAiSynced &&
+    (lyrics!.source === 'custom-lrc' ||
+      lyrics!.source === 'custom' ||
+      Boolean(lyrics!.source?.includes('lrclib-synced')))
 
   lyricsRef.current = lyrics
   tapIndexRef.current = tapIndex
   tapSyncActiveRef.current = tapSyncActive
-  currentTimeRef.current = currentTime
+  syncOffsetRef.current = syncOffset
+  currentTimeRef.current = clockTime
   trackIdRef.current = currentTrack?.id ?? null
 
   useEffect(() => {
@@ -125,12 +162,30 @@ export function LyricsView() {
       setTapSyncActive(false)
       setTapIndex(0)
       setSyncOffset(0)
+      setActiveLineIndex(-1)
+      setClockTime(0)
+      setManualTitle('')
+      setManualArtist('')
+      setManualCandidates([])
+      setManualError(null)
+      setManualSearching(false)
+      setManualLoadingId(null)
       tappedLinesRef.current = []
       lastSmartDurationRef.current = 0
       return
     }
 
-    setSyncOffset(readSyncOffset(currentTrack.id))
+    setSyncOffset(readLyricsTiming(currentTrack.id).offsetSeconds)
+    setManualTitle(cleanTrackTitle(currentTrack.name) || currentTrack.name)
+    setManualArtist(
+      primaryArtistName(
+        currentTrack.artists?.map((a) => a.name).join(', ') ?? '',
+      ),
+    )
+    setManualCandidates([])
+    setManualError(null)
+    setAiSyncStatus('idle')
+    autoAiKeyRef.current = null
 
     let cancelled = false
 
@@ -145,13 +200,18 @@ export function LyricsView() {
       tappedLinesRef.current = []
       lastActiveRef.current = -1
       lastSmartDurationRef.current = 0
+      setAiSyncStatus('idle')
 
-      const playerDuration = usePlayerStore.getState().duration
+      const { duration: audioDuration } = readAudioClock(
+        usePlayerStore.getState().progress,
+        usePlayerStore.getState().duration,
+      )
       const durationMs =
-        currentTrack!.duration_ms ??
-        (playerDuration > 0 ? Math.round(playerDuration * 1000) : undefined)
+        audioDuration > 0
+          ? Math.round(audioDuration * 1000)
+          : currentTrack!.duration_ms
 
-      const result = await fetchLyrics({
+      let result = await fetchLyrics({
         trackId: currentTrack!.id,
         trackName: currentTrack!.name,
         artistName: currentTrack!.artists?.[0]?.name ?? '',
@@ -159,11 +219,25 @@ export function LyricsView() {
         durationMs,
       })
 
+      if (
+        !cancelled &&
+        result?.isEstimated &&
+        audioDuration > 0
+      ) {
+        result = await recalculateSmartSyncWithAudio(result, audioDuration, {
+          audioUrl: usePlayerStore.getState().localAudioUrl,
+          audioElement: getPlayerAudioElement(),
+        })
+        lastSmartDurationRef.current = audioDuration
+      }
+
       if (cancelled) return
 
-      setLyrics(result)
+      const hasVerses = Boolean(result && result.lines.length > 0)
+      setLyrics(hasVerses ? result : null)
       setLoading(false)
-      if (!result) setError('Letra não encontrada')
+      if (!hasVerses) setError('Letra não encontrada')
+      else if (result?.isAiSynced) setAiSyncStatus('done')
     }
 
     void load()
@@ -173,36 +247,222 @@ export function LyricsView() {
     }
   }, [currentTrack?.id])
 
+  // Clock 60fps a partir do <audio> real (não depende de timeupdate ~4Hz)
   useEffect(() => {
-    if (duration <= 0) return
-    setLyrics((prev) => {
-      if (!prev?.isEstimated || !prev.plainText) return prev
-      if (Math.abs(duration - lastSmartDurationRef.current) < 0.5) return prev
-      lastSmartDurationRef.current = duration
-      return refreshEstimatedSync(prev, duration)
-    })
-  }, [duration, currentTrack?.id])
+    let raf = 0
+    let running = true
 
-  // Scroll suave para o verso ativo enquanto a faixa está a tocar
+    const tick = () => {
+      if (!running) return
+      const { currentTime: now } = readAudioClock(progress, duration)
+      setClockTime(now)
+
+      const current = lyricsRef.current
+      if (tapSyncActiveRef.current) {
+        setActiveLineIndex(
+          Math.min(
+            tapIndexRef.current,
+            Math.max((current?.lines.length ?? 1) - 1, 0),
+          ),
+        )
+      } else if (current?.synced && current.lines.length > 0) {
+        setActiveLineIndex(
+          findActiveLineIndex(
+            current.lines,
+            now - syncOffsetRef.current,
+          ),
+        )
+      } else {
+        setActiveLineIndex(-1)
+      }
+
+      if (isPlaying || tapSyncActiveRef.current) {
+        raf = window.requestAnimationFrame(tick)
+      }
+    }
+
+    tick()
+    if (isPlaying || tapSyncActive) {
+      raf = window.requestAnimationFrame(tick)
+    }
+
+    return () => {
+      running = false
+      if (raf) window.cancelAnimationFrame(raf)
+    }
+  }, [isPlaying, tapSyncActive, progress, duration, lyrics?.lines])
+
+  // Quando o player revela a duração real, recalcula smart sync com análise vocal
+  useEffect(() => {
+    const { duration: audioDuration } = readAudioClock(progress, duration)
+    if (audioDuration <= 0) return
+    if (Math.abs(audioDuration - lastSmartDurationRef.current) < 0.5) return
+
+    let cancelled = false
+    lastSmartDurationRef.current = audioDuration
+
+    void (async () => {
+      const prev = lyricsRef.current
+      if (!prev?.isEstimated || prev.isAiSynced || !prev.plainText) return
+      const next = await recalculateSmartSyncWithAudio(prev, audioDuration, {
+        audioUrl: localAudioUrl,
+        audioElement: getPlayerAudioElement(),
+      })
+      // Não sobrescrever se o Gemini já alinhou enquanto recalculávamos
+      if (!cancelled && !lyricsRef.current?.isAiSynced) setLyrics(next)
+    })()
+
+    return () => {
+      cancelled = true
+    }
+  }, [duration, progress, currentTrack?.id, localAudioUrl])
+
+  // Scroll suave para o verso ativo — apenas no container rolável das letras
   useEffect(() => {
     if (!isPlaying && !tapSyncActive) return
     if (activeLineIndex < 0 || activeLineIndex === lastActiveRef.current) return
     lastActiveRef.current = activeLineIndex
-    lineRefs.current[activeLineIndex]?.scrollIntoView({
-      behavior: 'smooth',
-      block: 'center',
-    })
+
+    const lineEl = lineRefs.current[activeLineIndex]
+    const container = scrollContainerRef.current
+    if (!lineEl || !container) return
+
+    const containerRect = container.getBoundingClientRect()
+    const lineRect = lineEl.getBoundingClientRect()
+    const nextTop =
+      container.scrollTop +
+      (lineRect.top - containerRect.top) -
+      containerRect.height / 2 +
+      lineRect.height / 2
+
+    container.scrollTo({ top: nextTop, behavior: 'smooth' })
   }, [activeLineIndex, isPlaying, tapSyncActive])
+
+  function persistOffset(next: number) {
+    if (!currentTrack) return
+    writeLyricsTiming(currentTrack.id, { offsetSeconds: next })
+  }
 
   function adjustSyncOffset(delta: number) {
     if (!currentTrack) return
     setSyncOffset((prev) => {
-      const next = Math.round((prev + delta) * 10) / 10
-      writeSyncOffset(currentTrack.id, next)
+      const next = Math.round((prev + delta) * 100) / 100
+      persistOffset(next)
       lastActiveRef.current = -1
       return next
     })
   }
+
+  function handleAnchorLine(line: LyricLine) {
+    if (!currentTrack) return
+    const { currentTime: now } = readAudioClock(progress, duration)
+    const newOffset = Math.round((now - line.time) * 100) / 100
+    setSyncOffset(newOffset)
+    persistOffset(newOffset)
+    lastActiveRef.current = -1
+    setActiveLineIndex(findActiveLineIndex(lyrics?.lines ?? [], now - newOffset))
+  }
+
+  async function handleRecalculateSync() {
+    if (!currentTrack || !lyrics?.plainText || !lyrics.isEstimated) return
+    const { duration: audioDuration } = readAudioClock(progress, duration)
+    const durationSec =
+      audioDuration > 0
+        ? audioDuration
+        : (currentTrack.duration_ms ?? 0) > 0
+          ? currentTrack.duration_ms! / 1000
+          : 0
+    lastSmartDurationRef.current = durationSec
+    lastActiveRef.current = -1
+    const next = await recalculateSmartSyncWithAudio(lyrics, durationSec, {
+      audioUrl: localAudioUrl,
+      audioElement: getPlayerAudioElement(),
+    })
+    setLyrics(next)
+    setSyncOffset(0)
+    persistOffset(0)
+  }
+
+  function resolveCurrentAudioSrc(): string | null {
+    const fromStore = localAudioUrl?.trim()
+    if (fromStore) return fromStore
+    const audio = getPlayerAudioElement()
+    const src = (audio?.currentSrc || audio?.src || '').trim()
+    return src || null
+  }
+
+  async function runAiSync(options?: { force?: boolean }) {
+    if (!currentTrack || !lyrics) return
+    if (aiSyncInFlightRef.current) return
+    if (!options?.force && lyrics.isAiSynced) return
+
+    const plainLines = getPlainLyricLines(lyrics)
+    const audioSrc = resolveCurrentAudioSrc()
+    if (plainLines.length === 0 || !audioSrc) {
+      setAiSyncStatus('error')
+      return
+    }
+
+    const { duration: audioDuration } = readAudioClock(progress, duration)
+    aiSyncInFlightRef.current = true
+    setAiSyncStatus('listening')
+
+    const next = await syncLyricsWithGemini(currentTrack, plainLines, audioSrc, {
+      force: options?.force === true,
+      durationSec:
+        audioDuration > 0
+          ? audioDuration
+          : (currentTrack.duration_ms ?? 0) > 0
+            ? currentTrack.duration_ms! / 1000
+            : undefined,
+    })
+
+    aiSyncInFlightRef.current = false
+
+    if (!next) {
+      setAiSyncStatus('error')
+      return
+    }
+
+    setLyrics(next)
+    setSyncOffset(0)
+    persistOffset(0)
+    lastActiveRef.current = -1
+    setAiSyncStatus('done')
+  }
+
+  // Auto Gemini sync em background para letras sem LRC oficial
+  useEffect(() => {
+    if (!currentTrack || loading) return
+    if (!lyrics?.isEstimated || lyrics.isAiSynced) return
+    if (isExactSync) return
+
+    const audioSrc = resolveCurrentAudioSrc()
+    if (!audioSrc) return
+
+    const key = `${currentTrack.id}::${lyrics.source}::${lyrics.lines[0]?.text ?? ''}`
+    if (autoAiKeyRef.current === key) return
+    autoAiKeyRef.current = key
+
+    let cancelled = false
+    void (async () => {
+      await runAiSync()
+      if (cancelled) return
+    })()
+
+    return () => {
+      cancelled = true
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    currentTrack?.id,
+    loading,
+    lyrics?.isEstimated,
+    lyrics?.isAiSynced,
+    lyrics?.source,
+    lyrics?.lines?.length,
+    localAudioUrl,
+  ])
 
   function markTapAtCurrentTime() {
     const current = lyricsRef.current
@@ -233,7 +493,7 @@ export function LyricsView() {
         if (saved) setLyrics(saved)
         // Offset deixa de ser necessário — sync exacta
         setSyncOffset(0)
-        writeSyncOffset(trackId, 0)
+        writeLyricsTiming(trackId, { offsetSeconds: 0 })
       }
       tapSyncActiveRef.current = false
       setTapSyncActive(false)
@@ -265,11 +525,32 @@ export function LyricsView() {
     return () => window.removeEventListener('keydown', onKeyDown)
   }, [tapSyncActive])
 
+  useEffect(() => {
+    function onEscape(event: KeyboardEvent) {
+      if (event.key !== 'Escape') return
+      const target = event.target as HTMLElement | null
+      if (
+        target &&
+        (target.tagName === 'TEXTAREA' ||
+          target.tagName === 'INPUT' ||
+          target.isContentEditable)
+      ) {
+        return
+      }
+      closeLyrics()
+    }
+
+    window.addEventListener('keydown', onEscape)
+    return () => window.removeEventListener('keydown', onEscape)
+  }, [closeLyrics])
+
   function handleLineClick(line: LyricLine) {
-    if (tapSyncActive || !hasLiveSync || duration <= 0) return
+    if (tapSyncActive || !hasLiveSync) return
+    const { duration: audioDuration } = readAudioClock(progress, duration)
+    if (audioDuration <= 0) return
     // Compensa o offset: linha T fica ativa quando currentTime = T + syncOffset
     const targetTime = Math.max(0, line.time + syncOffset)
-    seekTo(Math.min(1, Math.max(0, targetTime / duration)))
+    seekTo(Math.min(1, Math.max(0, targetTime / audioDuration)))
   }
 
   function startTapSync() {
@@ -292,106 +573,256 @@ export function LyricsView() {
 
   function handleSaveCustom() {
     if (!currentTrack) return
+    const { duration: audioDuration } = readAudioClock(progress, duration)
     const saved = saveCustomLyrics(
       currentTrack.id,
       pasteText,
-      duration > 0 ? duration : undefined,
+      audioDuration > 0 ? audioDuration : undefined,
     )
-    setLyrics(saved)
+    const hasVerses = Boolean(saved && saved.lines.length > 0)
+    setLyrics(hasVerses ? saved : null)
     setShowPaste(false)
-    setError(saved ? null : 'Letra não encontrada')
+    setError(hasVerses ? null : 'Letra não encontrada')
     lastActiveRef.current = -1
   }
 
+  async function handleManualSearch() {
+    const q = `${manualArtist.trim()} ${manualTitle.trim()}`.trim()
+    if (!q) {
+      setManualError('Indica título e artista para pesquisar.')
+      return
+    }
+
+    setManualSearching(true)
+    setManualError(null)
+    setManualCandidates([])
+
+    const candidates = await searchLyricsCandidates(q)
+    setManualCandidates(candidates)
+    setManualSearching(false)
+
+    if (candidates.length === 0) {
+      setManualError(
+        'Nenhum resultado. Ajusta o nome ou tenta colar a letra manualmente.',
+      )
+    }
+  }
+
+  async function handleSelectCandidate(candidate: LyricsSearchCandidate) {
+    if (!currentTrack) return
+
+    setManualLoadingId(candidate.id)
+    setManualError(null)
+
+    const playerDuration = usePlayerStore.getState().duration
+    const durationMs =
+      playerDuration > 0
+        ? Math.round(playerDuration * 1000)
+        : currentTrack.duration_ms
+
+    const result = await fetchLyricsFromCandidate({
+      trackId: currentTrack.id,
+      candidate,
+      durationMs,
+    })
+
+    setManualLoadingId(null)
+
+    if (!result || result.lines.length === 0) {
+      setManualError('Não foi possível carregar esta versão da letra.')
+      return
+    }
+
+    setLyrics(result)
+    setError(null)
+    setShowPaste(false)
+    lastActiveRef.current = -1
+    if (playerDuration > 0) lastSmartDurationRef.current = playerDuration
+  }
+
+  function handleSwapLyrics() {
+    if (!currentTrack) return
+
+    clearLyricsCache(currentTrack.id)
+    setLyrics(null)
+    setError('Escolhe outra versão da letra ou cola o texto correto.')
+    setShowPaste(false)
+    setPasteText('')
+    setTapSyncActive(false)
+    setTapIndex(0)
+    tappedLinesRef.current = []
+    lastActiveRef.current = -1
+    setManualCandidates([])
+    setManualError(null)
+    setAiSyncStatus('idle')
+    autoAiKeyRef.current = null
+    setManualTitle(cleanTrackTitle(currentTrack.name) || currentTrack.name)
+    setManualArtist(
+      primaryArtistName(
+        currentTrack.artists?.map((a) => a.name).join(', ') ?? '',
+      ),
+    )
+  }
+
   const searchUrl = buildExternalLyricsSearchUrl(title, artistName)
-  const showSyncToolbar = Boolean(lyrics && hasLiveSync && !tapSyncActive)
+  const syncedLines = lyrics?.lines ?? []
+  const hasSyncedVerses = syncedLines.length > 0
+  // Toolbar só com versos reais; lista vazia = painel de busca (nunca tela preta)
+  const showSyncToolbar = Boolean(hasSyncedVerses && !tapSyncActive)
+  const showManualFallback =
+    Boolean(currentTrack) && !loading && !hasSyncedVerses
 
   return (
-    <div className="absolute inset-0 z-20 flex flex-col overflow-hidden bg-[#0B0F19]">
+    <div className="fixed top-0 right-0 bottom-30 left-0 z-40 flex flex-col overflow-hidden bg-[#080B12]/98 backdrop-blur-2xl md:left-60 md:bottom-20 lg:left-64">
       {coverUrl && (
         <div
-          className="absolute inset-0 scale-110 bg-cover bg-center opacity-30 blur-3xl"
+          className="pointer-events-none absolute inset-0 scale-110 bg-cover bg-center opacity-25 blur-3xl"
           style={{ backgroundImage: `url(${coverUrl})` }}
           aria-hidden
         />
       )}
-      <div className="absolute inset-0 bg-[#0B0F19]/85 backdrop-blur-xl" />
+      <div className="pointer-events-none absolute inset-0 bg-[#080B12]/80" />
 
-      <div className="relative z-10 flex h-full min-h-0 flex-col">
-        <header className="flex shrink-0 items-center gap-3 border-b border-white/5 px-4 py-4 md:px-8">
+      {/* Cabeçalho fixo — nunca rola com as letras */}
+      <header className="relative z-20 shrink-0 border-b border-white/10 bg-[#080B12]/95 px-4 pt-4 pb-3 sm:px-8 sm:pt-5">
+        <div className="flex items-center gap-3">
           {coverUrl ? (
             <img
               src={coverUrl}
               alt=""
-              className="h-12 w-12 shrink-0 rounded-md object-cover shadow-lg"
+              className="h-11 w-11 shrink-0 rounded-lg object-cover shadow-lg sm:h-12 sm:w-12"
             />
           ) : (
-            <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-md bg-white/10">
+            <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg bg-white/10 sm:h-12 sm:w-12">
               <Mic2 className="size-5 text-[#94A3B8]" strokeWidth={ICON_STROKE} />
             </div>
           )}
 
           <div className="min-w-0 flex-1">
-            <h2 className="truncate text-base font-bold text-[#F8FAFC] md:text-lg">
+            <h2 className="truncate text-sm font-bold text-white sm:text-base">
               {title}
             </h2>
-            <p className="truncate text-sm text-[#94A3B8]">{artistName || '—'}</p>
+            <p className="truncate text-xs text-gray-400 sm:text-sm">
+              {artistName || '—'}
+            </p>
           </div>
 
           <button
             type="button"
             onClick={closeLyrics}
-            title="Fechar letras"
+            title="Fechar letras (Esc)"
             aria-label="Fechar letras"
-            className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-[#94A3B8] transition-colors hover:bg-white/10 hover:text-white"
+            className="flex shrink-0 cursor-pointer items-center gap-1.5 rounded-full border border-white/10 bg-white/10 px-3.5 py-2 text-white transition-all hover:border-cyan-400/50 hover:bg-cyan-500/20 hover:text-cyan-300"
           >
-            <ChevronDown className="size-6" strokeWidth={ICON_STROKE} />
+            <ChevronDown className="size-4" strokeWidth={ICON_STROKE} />
+            <span className="text-xs font-semibold">Fechar</span>
           </button>
-        </header>
+        </div>
 
         {showSyncToolbar && (
-          <div className="relative z-10 flex shrink-0 flex-wrap items-center gap-2 border-b border-white/5 px-4 py-2.5 md:px-8">
+          <div className="no-scrollbar mt-3 flex items-center gap-2 overflow-x-auto border-t border-white/5 pt-3">
             {isExactSync ? (
-              <span className="inline-flex items-center gap-1.5 rounded-full border border-cyan-400/25 bg-cyan-400/10 px-3 py-1 text-[11px] font-medium tracking-wide text-cyan-300">
+              <span className="inline-flex shrink-0 items-center gap-1.5 rounded-full border border-cyan-400/25 bg-cyan-400/10 px-3 py-1 text-[11px] font-medium tracking-wide whitespace-nowrap text-cyan-300">
                 <CheckCircle2
                   className="size-3.5 text-cyan-400"
                   strokeWidth={ICON_STROKE}
                 />
                 Sincronização salva (Exata)
               </span>
-            ) : lyrics?.isEstimated ? (
+            ) : lyrics?.isEstimated && !isAiSynced ? (
               <>
-                <span className="rounded-full border border-cyan-400/25 bg-cyan-400/10 px-3 py-1 text-[11px] font-medium tracking-wide text-cyan-300">
-                  Sincronização inteligente ativa
+                <span className="shrink-0 rounded-full border border-cyan-400/25 bg-cyan-400/10 px-3 py-1 text-[11px] font-medium tracking-wide whitespace-nowrap text-cyan-300">
+                  Sincronização inteligente
                 </span>
                 <button
                   type="button"
-                  onClick={startTapSync}
-                  className="rounded-full border border-white/15 px-3 py-1 text-[11px] font-medium text-[#F8FAFC] transition-colors hover:border-cyan-400/50 hover:text-cyan-400"
+                  onClick={handleRecalculateSync}
+                  className="shrink-0 rounded-full border border-cyan-400/40 px-3 py-1 text-[11px] font-medium whitespace-nowrap text-cyan-300 transition-colors hover:border-cyan-400 hover:bg-cyan-400/10 hover:text-cyan-200"
                 >
-                  Ajustar tempo (Tap Sync)
+                  Recalcular
+                </button>
+                <button
+                  type="button"
+                  onClick={startTapSync}
+                  className="shrink-0 rounded-full border border-white/15 px-3 py-1 text-[11px] font-medium whitespace-nowrap text-[#F8FAFC] transition-colors hover:border-cyan-400/50 hover:text-cyan-400"
+                >
+                  Tap Sync
                 </button>
               </>
-            ) : (
-              <span className="rounded-full border border-cyan-400/25 bg-cyan-400/10 px-3 py-1 text-[11px] font-medium tracking-wide text-cyan-300">
+            ) : !isAiSynced ? (
+              <span className="shrink-0 rounded-full border border-cyan-400/25 bg-cyan-400/10 px-3 py-1 text-[11px] font-medium tracking-wide whitespace-nowrap text-cyan-300">
                 Letra sincronizada
               </span>
-            )}
+            ) : null}
 
-            {/* Ajuste fino de offset por música */}
-            <div className="flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-2.5 py-1 text-xs text-gray-300">
+            {aiSyncStatus === 'listening' ? (
+              <span className="inline-flex shrink-0 animate-pulse items-center gap-1.5 rounded-full border border-violet-400/50 bg-gradient-to-r from-cyan-400/20 to-violet-500/25 px-3 py-1 text-[11px] font-semibold whitespace-nowrap text-cyan-100">
+                <Sparkles
+                  className="size-3.5 text-cyan-300"
+                  strokeWidth={ICON_STROKE}
+                />
+                Ouvindo faixa...
+              </span>
+            ) : isAiSynced || aiSyncStatus === 'done' ? (
+              <button
+                type="button"
+                onClick={() => void runAiSync({ force: true })}
+                title="Reexecutar alinhamento Gemini"
+                className="inline-flex shrink-0 items-center gap-1.5 rounded-full border border-violet-400/35 bg-gradient-to-r from-cyan-400/15 to-violet-500/20 px-3 py-1 text-[11px] font-semibold tracking-wide whitespace-nowrap text-cyan-200 transition-colors hover:border-cyan-300/50 hover:text-white"
+              >
+                <Sparkles
+                  className="size-3.5 text-violet-300"
+                  strokeWidth={ICON_STROKE}
+                />
+                IA Sincronizada
+              </button>
+            ) : lyrics?.isEstimated ? (
+              <button
+                type="button"
+                onClick={() => void runAiSync({ force: true })}
+                title="Alinhar versos ao áudio com Gemini"
+                className="inline-flex shrink-0 items-center gap-1.5 rounded-full border border-violet-400/40 bg-gradient-to-r from-cyan-400/10 to-violet-500/15 px-3 py-1 text-[11px] font-semibold whitespace-nowrap text-cyan-200 transition-colors hover:border-cyan-300/60 hover:text-white"
+              >
+                <Sparkles
+                  className="size-3.5 text-violet-300"
+                  strokeWidth={ICON_STROKE}
+                />
+                Sincronizar com IA
+              </button>
+            ) : null}
+
+            <button
+              type="button"
+              onClick={handleSwapLyrics}
+              title="Remover esta letra e buscar outra versão"
+              className="inline-flex shrink-0 items-center gap-1.5 rounded-full border border-white/10 px-3 py-1 text-[11px] font-medium whitespace-nowrap text-[#94A3B8] transition-colors hover:border-cyan-400/40 hover:text-cyan-300"
+            >
+              <RefreshCw className="size-3" strokeWidth={ICON_STROKE} />
+              Trocar letra
+            </button>
+
+            <div className="flex shrink-0 items-center gap-1 rounded-full border border-white/10 bg-white/5 px-2 py-1 text-xs text-gray-300">
               <button
                 type="button"
                 onClick={() => adjustSyncOffset(-OFFSET_STEP)}
                 title="Adiantar letra (−0.5s)"
                 aria-label="Adiantar letra 0.5 segundos"
-                className="flex items-center gap-0.5 rounded-full px-1.5 py-0.5 transition-colors hover:bg-white/10 hover:text-cyan-400"
+                className="rounded-full px-1.5 py-0.5 transition-colors hover:bg-white/10 hover:text-cyan-400"
+              >
+                −0.5
+              </button>
+              <button
+                type="button"
+                onClick={() => adjustSyncOffset(-OFFSET_FINE_STEP)}
+                title="Adiantar letra (−0.1s)"
+                aria-label="Adiantar letra 0.1 segundos"
+                className="inline-flex items-center gap-0.5 rounded-full px-1.5 py-0.5 transition-colors hover:bg-white/10 hover:text-cyan-400"
               >
                 <Minus className="size-3" strokeWidth={ICON_STROKE} />
-                0.5s
+                0.1
               </button>
               <span
-                className={`min-w-[3.25rem] text-center font-mono tabular-nums ${
+                className={`min-w-[3.5rem] text-center font-mono tabular-nums ${
                   syncOffset === 0 ? 'text-gray-400' : 'text-cyan-400'
                 }`}
                 title="Deslocamento da letra"
@@ -400,77 +831,96 @@ export function LyricsView() {
               </span>
               <button
                 type="button"
+                onClick={() => adjustSyncOffset(OFFSET_FINE_STEP)}
+                title="Atrasar letra (+0.1s)"
+                aria-label="Atrasar letra 0.1 segundos"
+                className="inline-flex items-center gap-0.5 rounded-full px-1.5 py-0.5 transition-colors hover:bg-white/10 hover:text-cyan-400"
+              >
+                <Plus className="size-3" strokeWidth={ICON_STROKE} />
+                0.1
+              </button>
+              <button
+                type="button"
                 onClick={() => adjustSyncOffset(OFFSET_STEP)}
                 title="Atrasar letra (+0.5s)"
                 aria-label="Atrasar letra 0.5 segundos"
-                className="flex items-center gap-0.5 rounded-full px-1.5 py-0.5 transition-colors hover:bg-white/10 hover:text-cyan-400"
+                className="rounded-full px-1.5 py-0.5 transition-colors hover:bg-white/10 hover:text-cyan-400"
               >
-                <Plus className="size-3" strokeWidth={ICON_STROKE} />
-                0.5s
+                +0.5
               </button>
             </div>
           </div>
         )}
 
         {tapSyncActive && lyrics && (
-          <div className="relative z-10 flex shrink-0 flex-wrap items-center gap-3 border-b border-cyan-400/20 bg-cyan-400/5 px-4 py-3 md:px-8">
-            <p className="text-sm text-[#F8FAFC]">
+          <div className="no-scrollbar mt-3 flex items-center gap-3 overflow-x-auto border-t border-cyan-400/20 pt-3">
+            <p className="shrink-0 text-sm whitespace-nowrap text-[#F8FAFC]">
               Marca o verso{' '}
               <span className="font-bold text-cyan-400">
                 {Math.min(tapIndex + 1, lyrics.lines.length)}/
                 {lyrics.lines.length}
-              </span>{' '}
-              no ritmo da música
+              </span>
               <span className="text-[#94A3B8]"> · Espaço</span>
             </p>
             <button
               type="button"
               onClick={markTapAtCurrentTime}
-              className="rounded-full bg-cyan-400 px-4 py-1.5 text-sm font-bold text-gray-900 transition-transform hover:scale-105"
+              className="shrink-0 rounded-full bg-cyan-400 px-4 py-1.5 text-sm font-bold whitespace-nowrap text-gray-900 transition-transform hover:scale-105"
             >
               Marcar verso atual
             </button>
             <button
               type="button"
               onClick={cancelTapSync}
-              className="rounded-full border border-white/15 px-3 py-1.5 text-sm text-[#94A3B8] hover:text-white"
+              className="shrink-0 rounded-full border border-white/15 px-3 py-1.5 text-sm whitespace-nowrap text-[#94A3B8] hover:text-white"
             >
               Cancelar
             </button>
           </div>
         )}
+      </header>
 
-        <div className="min-h-0 flex-1 overflow-y-auto py-10 md:py-14">
-          {!currentTrack && (
-            <p className="px-8 text-center text-lg text-[#94A3B8] md:px-16">
-              Reproduza uma faixa para ver a letra.
-            </p>
-          )}
+      {/* Só esta área rola */}
+      <div
+        ref={scrollContainerRef}
+        className="relative z-10 min-h-0 flex-1 overflow-y-auto scroll-smooth px-5 py-20 sm:px-12 sm:py-28 md:px-20"
+        style={{
+          maskImage:
+            'linear-gradient(to bottom, transparent, black 10%, black 88%, transparent)',
+          WebkitMaskImage:
+            'linear-gradient(to bottom, transparent, black 10%, black 88%, transparent)',
+        }}
+      >
+        {!currentTrack && (
+          <p className="text-center text-lg text-[#94A3B8]">
+            Reproduza uma faixa para ver a letra.
+          </p>
+        )}
 
-          {currentTrack && loading && (
-            <p className="px-8 text-center text-lg text-cyan-400 md:px-16">
-              A procurar letra…
-            </p>
-          )}
+        {currentTrack && loading && (
+          <p className="text-center text-lg text-cyan-400">A procurar letra…</p>
+        )}
 
-          {currentTrack && !loading && lyrics && (
-            <div className="mx-auto flex w-full max-w-4xl flex-col gap-5 px-8 md:gap-6 md:px-16">
-              {lyrics.lines.map((line, index) => {
-                const isActive = index === activeLineIndex && !tapSyncActive
-                const isPendingTap = tapSyncActive && index === tapIndex
-                const isTapped = tapSyncActive && index < tapIndex
+        {currentTrack && !loading && hasSyncedVerses && (
+          <div className="mx-auto max-w-3xl space-y-5 sm:space-y-6">
+            {syncedLines.map((line, index) => {
+              const isActive = index === activeLineIndex && !tapSyncActive
+              const isPendingTap = tapSyncActive && index === tapIndex
+              const isTapped = tapSyncActive && index < tapIndex
 
-                // Tipografia estável: mesmo tamanho; destaque só por cor/opacidade
-                const className =
-                  isActive || isPendingTap
-                    ? 'cursor-pointer text-left text-2xl font-bold leading-relaxed text-cyan-400 opacity-100 drop-shadow-[0_0_12px_rgba(34,211,238,0.4)] transition-all duration-300 md:text-3xl'
-                    : isTapped
-                      ? 'cursor-pointer text-left text-2xl font-bold leading-relaxed text-white/50 transition-all duration-300 md:text-3xl'
-                      : 'cursor-pointer text-left text-2xl font-bold leading-relaxed text-white/30 transition-all duration-300 hover:text-white/70 md:text-3xl'
+              const className =
+                isActive || isPendingTap
+                  ? 'min-w-0 flex-1 cursor-pointer text-left text-xl font-bold leading-relaxed text-cyan-400 opacity-100 drop-shadow-[0_0_12px_rgba(34,211,238,0.4)] transition-colors duration-100 sm:text-2xl md:text-3xl'
+                  : isTapped
+                    ? 'min-w-0 flex-1 cursor-pointer text-left text-xl font-bold leading-relaxed text-white/50 transition-colors duration-100 sm:text-2xl md:text-3xl'
+                    : 'min-w-0 flex-1 cursor-pointer text-left text-xl font-bold leading-relaxed text-white/30 transition-colors duration-100 hover:text-white/70 sm:text-2xl md:text-3xl'
 
-                return (
+              return (
+                <div
+                  key={`${line.text}-${index}`}
+                  className="group relative flex items-center gap-2"
+                >
                   <button
-                    key={`${line.text}-${index}`}
                     type="button"
                     ref={(el) => {
                       lineRefs.current[index] = el
@@ -484,87 +934,188 @@ export function LyricsView() {
                   >
                     {line.text}
                   </button>
-                )
-              })}
+                  {!tapSyncActive && hasLiveSync && (
+                    <button
+                      type="button"
+                      title="Ancorar aqui — alinha a letra a este verso"
+                      aria-label="Ancorar sincronização neste verso"
+                      onClick={(event) => {
+                        event.stopPropagation()
+                        handleAnchorLine(line)
+                      }}
+                      className="shrink-0 rounded-full border border-white/10 bg-white/5 p-1.5 text-[#94A3B8] opacity-0 transition-all group-hover:opacity-100 hover:border-cyan-400/50 hover:text-cyan-300 focus:opacity-100 sm:opacity-0"
+                    >
+                      <Crosshair className="size-3.5" strokeWidth={ICON_STROKE} />
+                    </button>
+                  )}
+                </div>
+              )
+            })}
+          </div>
+        )}
+
+        {showManualFallback && (
+          <div className="mx-auto flex w-full max-w-lg flex-col items-center gap-5 px-2 text-center">
+            <div className="flex h-16 w-16 items-center justify-center rounded-full border border-white/10 bg-white/5">
+              <Mic2
+                className="size-7 text-[#94A3B8]"
+                strokeWidth={ICON_STROKE}
+              />
             </div>
-          )}
+            <div>
+              <h3 className="mb-2 text-xl font-bold text-[#F8FAFC]">
+                Letra indisponível
+              </h3>
+              <p className="text-sm text-[#94A3B8]">
+                {error ??
+                  'Não encontrámos a letra automaticamente. Ajusta o título/artista e busca no Azuri.'}
+              </p>
+            </div>
 
-          {currentTrack && !loading && !lyrics && (
-            <div className="mx-auto flex max-w-md flex-col items-center gap-6 px-8 text-center md:px-16">
-              <div className="flex h-16 w-16 items-center justify-center rounded-full border border-white/10 bg-white/5">
-                <Mic2
-                  className="size-7 text-[#94A3B8]"
-                  strokeWidth={ICON_STROKE}
-                />
-              </div>
-              <div>
-                <h3 className="mb-2 text-xl font-bold text-[#F8FAFC]">
-                  Letra indisponível
-                </h3>
-                <p className="text-sm text-[#94A3B8]">
-                  {error ??
-                    'Não encontrámos a letra desta faixa. Podes colar uma letra manualmente ou pesquisar online.'}
-                </p>
-              </div>
-
-              {!showPaste ? (
-                <div className="flex flex-wrap items-center justify-center gap-3">
-                  <button
-                    type="button"
-                    onClick={() => setShowPaste(true)}
-                    className="rounded-full bg-cyan-400 px-5 py-2.5 text-sm font-bold text-gray-900 transition-transform hover:scale-105"
-                  >
-                    Colar letra manualmente
-                  </button>
-                  <a
-                    href={searchUrl}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="inline-flex items-center gap-2 rounded-full border border-white/15 px-5 py-2.5 text-sm font-medium text-[#F8FAFC] transition-colors hover:border-cyan-400/50 hover:text-cyan-400"
-                  >
-                    Pesquisar no Google
-                    <ExternalLink
-                      className="size-3.5"
-                      strokeWidth={ICON_STROKE}
-                    />
-                  </a>
-                </div>
-              ) : (
-                <div className="w-full space-y-3 text-left">
-                  <label className="block text-xs font-medium uppercase tracking-wider text-[#94A3B8]">
-                    Cola a letra (texto simples ou formato LRC)
-                  </label>
-                  <textarea
-                    value={pasteText}
-                    onChange={(e) => setPasteText(e.target.value)}
-                    rows={10}
-                    placeholder={
-                      '[00:12.00] Primeira linha\n[00:16.50] Segunda linha'
-                    }
-                    className="w-full resize-y rounded-xl border border-white/10 bg-black/40 px-4 py-3 text-sm text-[#F8FAFC] outline-none placeholder:text-[#94A3B8]/60 focus:border-cyan-400/50"
+            <div className="w-full rounded-2xl border border-white/10 bg-white/5 p-4 text-left shadow-[0_0_40px_rgba(34,211,238,0.08)] backdrop-blur-xl sm:p-5">
+              <p className="mb-3 text-xs font-semibold uppercase tracking-[0.18em] text-cyan-300/80">
+                Buscador Azuri
+              </p>
+              <div className="grid gap-3 sm:grid-cols-2">
+                <label className="block text-left">
+                  <span className="mb-1.5 block text-[11px] font-medium uppercase tracking-wider text-[#94A3B8]">
+                    Título
+                  </span>
+                  <input
+                    type="text"
+                    value={manualTitle}
+                    onChange={(e) => setManualTitle(e.target.value)}
+                    className="w-full rounded-xl border border-white/10 bg-black/35 px-3 py-2.5 text-sm text-white outline-none placeholder:text-gray-600 focus:border-cyan-400/50"
+                    placeholder="Nome da faixa"
                   />
-                  <div className="flex flex-wrap gap-2">
-                    <button
-                      type="button"
-                      onClick={handleSaveCustom}
-                      disabled={!pasteText.trim()}
-                      className="rounded-full bg-cyan-400 px-5 py-2.5 text-sm font-bold text-gray-900 transition-transform hover:scale-105 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:scale-100"
-                    >
-                      Guardar letra
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setShowPaste(false)}
-                      className="rounded-full border border-white/15 px-5 py-2.5 text-sm font-medium text-[#94A3B8] hover:text-white"
-                    >
-                      Cancelar
-                    </button>
-                  </div>
-                </div>
+                </label>
+                <label className="block text-left">
+                  <span className="mb-1.5 block text-[11px] font-medium uppercase tracking-wider text-[#94A3B8]">
+                    Artista
+                  </span>
+                  <input
+                    type="text"
+                    value={manualArtist}
+                    onChange={(e) => setManualArtist(e.target.value)}
+                    className="w-full rounded-xl border border-white/10 bg-black/35 px-3 py-2.5 text-sm text-white outline-none placeholder:text-gray-600 focus:border-cyan-400/50"
+                    placeholder="Artista principal"
+                  />
+                </label>
+              </div>
+              <button
+                type="button"
+                onClick={() => void handleManualSearch()}
+                disabled={manualSearching}
+                className="mt-4 inline-flex w-full items-center justify-center gap-2 rounded-full bg-cyan-400 px-5 py-2.5 text-sm font-bold text-[#080B12] transition-all hover:bg-cyan-300 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <Search className="size-4" strokeWidth={ICON_STROKE} />
+                {manualSearching ? 'A buscar…' : 'Buscar no Azuri'}
+              </button>
+
+              {manualError && (
+                <p className="mt-3 text-sm text-amber-300/90">{manualError}</p>
+              )}
+
+              {manualCandidates.length > 0 && (
+                <ul className="mt-4 max-h-64 space-y-2 overflow-y-auto pr-1">
+                  {manualCandidates.map((candidate) => {
+                    const loadingThis = manualLoadingId === candidate.id
+                    return (
+                      <li key={`${candidate.source}-${candidate.id}`}>
+                        <button
+                          type="button"
+                          onClick={() => void handleSelectCandidate(candidate)}
+                          disabled={manualLoadingId != null}
+                          className="flex w-full items-start justify-between gap-3 rounded-xl border border-white/10 bg-black/30 px-3 py-3 text-left transition-colors hover:border-cyan-400/40 hover:bg-cyan-400/5 disabled:opacity-60"
+                        >
+                          <div className="min-w-0">
+                            <p className="truncate text-sm font-semibold text-white">
+                              {candidate.title}
+                            </p>
+                            <p className="truncate text-xs text-[#94A3B8]">
+                              {candidate.artist}
+                            </p>
+                            <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+                              <span className="rounded-full border border-white/10 px-2 py-0.5 text-[10px] uppercase tracking-wide text-gray-400">
+                                {candidate.source === 'genius'
+                                  ? 'Genius'
+                                  : 'LRCLIB'}
+                              </span>
+                              {candidate.hasSynced && (
+                                <span className="rounded-full border border-cyan-400/30 bg-cyan-400/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-cyan-300">
+                                  Sincronizada
+                                </span>
+                              )}
+                            </div>
+                          </div>
+                          <span className="shrink-0 text-xs font-medium text-cyan-300">
+                            {loadingThis ? '…' : 'Usar'}
+                          </span>
+                        </button>
+                      </li>
+                    )
+                  })}
+                </ul>
               )}
             </div>
-          )}
-        </div>
+
+            {!showPaste ? (
+              <div className="flex flex-wrap items-center justify-center gap-3">
+                <button
+                  type="button"
+                  onClick={() => setShowPaste(true)}
+                  className="rounded-full border border-white/15 px-5 py-2.5 text-sm font-medium text-[#F8FAFC] transition-colors hover:border-cyan-400/50 hover:text-cyan-400"
+                >
+                  Colar letra manualmente
+                </button>
+                <a
+                  href={searchUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center gap-2 rounded-full border border-white/15 px-5 py-2.5 text-sm font-medium text-[#F8FAFC] transition-colors hover:border-cyan-400/50 hover:text-cyan-400"
+                >
+                  Pesquisar no Google
+                  <ExternalLink
+                    className="size-3.5"
+                    strokeWidth={ICON_STROKE}
+                  />
+                </a>
+              </div>
+            ) : (
+              <div className="w-full space-y-3 text-left">
+                <label className="block text-xs font-medium uppercase tracking-wider text-[#94A3B8]">
+                  Cola a letra (texto simples ou formato LRC)
+                </label>
+                <textarea
+                  value={pasteText}
+                  onChange={(e) => setPasteText(e.target.value)}
+                  rows={10}
+                  placeholder={
+                    '[00:12.00] Primeira linha\n[00:16.50] Segunda linha'
+                  }
+                  className="w-full resize-y rounded-xl border border-white/10 bg-black/40 px-4 py-3 text-sm text-[#F8FAFC] outline-none placeholder:text-[#94A3B8]/60 focus:border-cyan-400/50"
+                />
+                <div className="flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    onClick={handleSaveCustom}
+                    disabled={!pasteText.trim()}
+                    className="rounded-full bg-cyan-400 px-5 py-2.5 text-sm font-bold text-gray-900 transition-transform hover:scale-105 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:scale-100"
+                  >
+                    Guardar letra
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setShowPaste(false)}
+                    className="rounded-full border border-white/15 px-5 py-2.5 text-sm font-medium text-[#94A3B8] hover:text-white"
+                  >
+                    Cancelar
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
       </div>
     </div>
   )

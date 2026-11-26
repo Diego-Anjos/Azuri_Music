@@ -4,21 +4,20 @@ import {
   ListMusic,
   Plus,
   Search,
-  X,
 } from 'lucide-react'
-import { useEffect, useState, type FormEvent } from 'react'
+import { useEffect, useState } from 'react'
 import { Link, useLocation, useNavigate } from 'react-router-dom'
+import { CreatePlaylistModal } from '../CreatePlaylistModal'
 import {
-  createPlaylist,
   getPlaylists,
   subscribeLibraryUpdates,
   type UserPlaylist,
 } from '../../services/libraryStorage'
 
 const navItems = [
-  { id: 'home', label: 'Home', icon: Home, to: '/' },
+  { id: 'home', label: 'Home', icon: Home, to: '/home' },
   { id: 'search', label: 'Search', icon: Search, to: '/search' },
-  { id: 'library', label: 'Library', icon: Library, to: '/' },
+  { id: 'library', label: 'Library', icon: Library, to: '/library' },
 ] as const
 
 const ICON_STROKE = 1.5
@@ -28,7 +27,6 @@ export function Sidebar() {
   const navigate = useNavigate()
   const [playlists, setPlaylists] = useState<UserPlaylist[]>(() => getPlaylists())
   const [isCreating, setIsCreating] = useState(false)
-  const [newPlaylistName, setNewPlaylistName] = useState('')
 
   useEffect(() => {
     setPlaylists(getPlaylists())
@@ -37,22 +35,10 @@ export function Sidebar() {
     })
   }, [])
 
-  function handleCreatePlaylist(event: FormEvent) {
-    event.preventDefault()
-    const trimmed = newPlaylistName.trim()
-    if (!trimmed) return
-
-    const playlist = createPlaylist(trimmed)
-    setNewPlaylistName('')
-    setIsCreating(false)
-    setPlaylists(getPlaylists())
-    navigate(`/playlist/${playlist.id}`)
-  }
-
   return (
-    <aside className="hidden h-full w-64 shrink-0 flex-col bg-[#0B0F19] md:flex">
+    <aside className="hidden h-full shrink-0 flex-col bg-[#0B0F19] md:flex md:w-60 lg:w-64">
       <div className="px-4 pt-6">
-        <Link to="/" className="block">
+        <Link to="/home" className="block">
           <div className="mb-4 flex items-center gap-2.5 px-4 py-4">
             <img
               src="/logo.png"
@@ -69,8 +55,8 @@ export function Sidebar() {
           {navItems.map(({ id, label, icon: Icon, to }) => {
             const isActive =
               id === 'home'
-                ? location.pathname === '/'
-                : location.pathname.startsWith(to) && to !== '/'
+                ? location.pathname === '/home'
+                : location.pathname.startsWith(to)
 
             return (
               <Link
@@ -89,53 +75,14 @@ export function Sidebar() {
           })}
         </nav>
 
-        {!isCreating ? (
-          <button
-            type="button"
-            onClick={() => setIsCreating(true)}
-            className="mt-4 flex w-full items-center gap-3 rounded-full px-4 py-2.5 text-sm font-medium text-[#94A3B8] transition-colors duration-200 hover:text-[#F8FAFC]"
-          >
-            <Plus className="size-5 shrink-0" strokeWidth={ICON_STROKE} />
-            <span>Criar playlist</span>
-          </button>
-        ) : (
-          <form
-            onSubmit={handleCreatePlaylist}
-            className="mt-4 rounded-xl border border-white/10 bg-white/5 p-2"
-          >
-            <div className="mb-2 flex items-center justify-between px-1">
-              <span className="text-xs font-medium text-gray-400">
-                Nova playlist
-              </span>
-              <button
-                type="button"
-                onClick={() => {
-                  setIsCreating(false)
-                  setNewPlaylistName('')
-                }}
-                className="rounded-full p-1 text-gray-400 hover:text-white"
-                aria-label="Cancelar"
-              >
-                <X className="h-3.5 w-3.5" strokeWidth={ICON_STROKE} />
-              </button>
-            </div>
-            <input
-              autoFocus
-              type="text"
-              value={newPlaylistName}
-              onChange={(event) => setNewPlaylistName(event.target.value)}
-              placeholder="Nome da playlist"
-              className="mb-2 w-full rounded-lg border border-white/10 bg-[#0B0F19] px-2.5 py-1.5 text-sm text-white outline-none placeholder:text-gray-600 focus:border-cyan-400/50"
-            />
-            <button
-              type="submit"
-              disabled={!newPlaylistName.trim()}
-              className="w-full rounded-lg bg-cyan-400 py-1.5 text-xs font-bold text-black transition-colors hover:bg-cyan-300 disabled:cursor-not-allowed disabled:opacity-40"
-            >
-              Criar
-            </button>
-          </form>
-        )}
+        <button
+          type="button"
+          onClick={() => setIsCreating(true)}
+          className="mt-4 flex w-full items-center gap-3 rounded-full px-4 py-2.5 text-sm font-medium text-[#94A3B8] transition-colors duration-200 hover:text-[#F8FAFC]"
+        >
+          <Plus className="size-5 shrink-0" strokeWidth={ICON_STROKE} />
+          <span>Criar playlist</span>
+        </button>
       </div>
 
       <div className="mx-4 mt-4 border-t border-white/10" />
@@ -192,6 +139,15 @@ export function Sidebar() {
           })}
         </div>
       </div>
+
+      <CreatePlaylistModal
+        open={isCreating}
+        onClose={() => setIsCreating(false)}
+        onCreated={(playlist) => {
+          setPlaylists(getPlaylists())
+          navigate(`/playlist/${playlist.id}`)
+        }}
+      />
     </aside>
   )
 }

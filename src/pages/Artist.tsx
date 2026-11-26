@@ -1,36 +1,20 @@
-import { ChevronDown, ChevronUp, Loader2, MapPin, Play } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { ChevronLeft, ChevronRight, Loader2, MapPin, Play } from 'lucide-react'
+import { useEffect, useRef, useState } from 'react'
 import { useLocation, useNavigate, useParams } from 'react-router-dom'
 import { TrackRow } from '../components/TrackRow'
 import {
+  getAllArtistTracks,
   getArtistProfile,
-  searchArtistTracksPage,
   type ArtistProfile,
   type ArtistProfileTrack,
 } from '../services/spotify'
 import { usePlayerStore } from '../store/usePlayerStore'
 
 const ICON_STROKE = 1.5
-const INITIAL_VISIBLE = 5
-const PAGE_SIZE = 10
+const TRACKS_PER_PAGE = 10
 
 type ArtistLocationState = {
   artistName?: string
-}
-
-function mergeUniqueTracks(
-  current: ArtistProfileTrack[],
-  incoming: ArtistProfileTrack[],
-): ArtistProfileTrack[] {
-  const seen = new Set(current.map((t) => t.id))
-  const merged = [...current]
-  for (const track of incoming) {
-    if (!seen.has(track.id)) {
-      seen.add(track.id)
-      merged.push(track)
-    }
-  }
-  return merged
 }
 
 function isValidHttpsUrl(url: string | null | undefined): url is string {
@@ -38,7 +22,6 @@ function isValidHttpsUrl(url: string | null | undefined): url is string {
 }
 
 function getAlbumFallback(artist: ArtistProfile): string | null {
-  // ArtistProfileAlbum usa imageUrl (não images[])
   const albumCover = artist.albums?.[0]?.imageUrl
   return isValidHttpsUrl(albumCover) ? albumCover : null
 }
@@ -62,6 +45,20 @@ function resolveInitialBanner(artist: ArtistProfile): {
   return { src: null, isOfficial: false }
 }
 
+function buildPageNumbers(totalPages: number, currentPage: number): number[] {
+  if (totalPages <= 7) {
+    return Array.from({ length: totalPages }, (_, i) => i + 1)
+  }
+
+  const pages = new Set<number>([1, totalPages, currentPage])
+  for (let delta = 1; delta <= 2; delta++) {
+    if (currentPage - delta > 1) pages.add(currentPage - delta)
+    if (currentPage + delta < totalPages) pages.add(currentPage + delta)
+  }
+
+  return [...pages].sort((a, b) => a - b)
+}
+
 export function Artist() {
   const { id } = useParams<{ id: string }>()
   const location = useLocation()
@@ -69,15 +66,15 @@ export function Artist() {
   const playTrack = usePlayerStore((state) => state.playTrack)
   const artistName =
     (location.state as ArtistLocationState | null)?.artistName || ''
+  const tracksSectionRef = useRef<HTMLDivElement | null>(null)
 
   const [artist, setArtist] = useState<ArtistProfile | null>(null)
   const [loading, setLoading] = useState(true)
   const [isFollowing, setIsFollowing] = useState(false)
-  const [loadedTracks, setLoadedTracks] = useState<ArtistProfileTrack[]>([])
-  const [visibleCount, setVisibleCount] = useState(INITIAL_VISIBLE)
-  const [tracksOffset, setTracksOffset] = useState(0)
-  const [hasMoreTracks, setHasMoreTracks] = useState(true)
-  const [isLoadingMore, setIsLoadingMore] = useState(false)
+  const [allTracks, setAllTracks] = useState<ArtistProfileTrack[]>([])
+  const [currentPage, setCurrentPage] = useState(1)
+  const [showAllTracks, setShowAllTracks] = useState(false)
+  const [isLoadingTracks, setIsLoadingTracks] = useState(false)
   const [isBioExpanded, setIsBioExpanded] = useState(false)
   const [bannerSrc, setBannerSrc] = useState<string | null>(null)
   const [isOfficialBanner, setIsOfficialBanner] = useState(false)
@@ -89,23 +86,49 @@ export function Artist() {
       setIsBioExpanded(false)
       setBannerSrc(null)
       setIsOfficialBanner(false)
-      setLoadedTracks([])
-      setVisibleCount(INITIAL_VISIBLE)
-      setTracksOffset(0)
-      setHasMoreTracks(true)
+      setAllTracks([])
+      setCurrentPage(1)
+      setShowAllTracks(false)
+      setIsLoadingTracks(true)
 
       const data = await getArtistProfile(id, artistName || undefined)
       setArtist(data)
 
       if (data) {
-        const initial = data.topTracks ?? []
-        setLoadedTracks(initial)
-        setVisibleCount(Math.min(INITIAL_VISIBLE, initial.length))
-        setTracksOffset(initial.length)
-        setHasMoreTracks(initial.length > 0)
         const resolved = resolveInitialBanner(data)
         setBannerSrc(resolved.src)
         setIsOfficialBanner(resolved.isOfficial)
+
+        // Mostra topTracks imediatamente enquanto o catálogo completo carrega
+        setAllTracks(data.topTracks ?? [])
+
+        try {
+          const catalog = await getAllArtistTracks(data.id, data.name, {
+            artistImageUrl: data.images?.[0]?.url ?? null,
+          })
+
+          const unified =
+            catalog.tracks.length > 0 ? catalog.tracks : data.topTracks ?? []
+          // Resumo e lista ficam iguais: max(catálogo unificado, SoundCloud)
+          const syncedTotal = Math.max(
+            unified.length,
+            catalog.soundcloudTotal,
+            catalog.total,
+          )
+
+          setAllTracks(unified)
+          setArtist({
+            ...data,
+            topTracks: unified,
+            totalTracksCount: syncedTotal,
+          })
+        } catch (error) {
+          console.error('Erro ao carregar catálogo completo:', error)
+        } finally {
+          setIsLoadingTracks(false)
+        }
+      } else {
+        setIsLoadingTracks(false)
       }
 
       setLoading(false)
@@ -115,50 +138,43 @@ export function Artist() {
   }, [id, artistName])
 
   const avatarUrl = artist?.images?.[0]?.url
-  const visibleTracks = loadedTracks.slice(0, visibleCount)
-  const isExpanded = visibleCount > INITIAL_VISIBLE
+  const loadedCount = allTracks.length
+  // Mesmo número no Resumo e no "Mostrando … de N músicas"
+  const displayTrackCount =
+    loadedCount > 0
+      ? Math.max(artist?.totalTracksCount ?? 0, loadedCount)
+      : artist?.totalTracksCount ?? 0
+  const totalPages = Math.max(1, Math.ceil(loadedCount / TRACKS_PER_PAGE))
+  const safePage = Math.min(currentPage, totalPages)
+  const startIndex = showAllTracks ? 0 : (safePage - 1) * TRACKS_PER_PAGE
+  const endIndex = showAllTracks
+    ? loadedCount
+    : Math.min(startIndex + TRACKS_PER_PAGE, loadedCount)
+  const visibleTracks = allTracks.slice(startIndex, endIndex)
+  const showPagination = !showAllTracks && loadedCount > TRACKS_PER_PAGE
+  const pageNumbers = buildPageNumbers(totalPages, safePage)
 
-  async function handleLoadMoreTracks() {
-    if (!artist || isLoadingMore) return
-
-    // Já há faixas carregadas além do compacto — só expandir
-    if (visibleCount < loadedTracks.length) {
-      setVisibleCount(loadedTracks.length)
-      return
-    }
-
-    if (!hasMoreTracks) return
-
-    setIsLoadingMore(true)
-    try {
-      const page = await searchArtistTracksPage(
-        artist.name,
-        artist.id,
-        tracksOffset,
-        PAGE_SIZE,
-      )
-      const merged = mergeUniqueTracks(loadedTracks, page.tracks)
-      setLoadedTracks(merged)
-      setTracksOffset(page.nextOffset)
-      // Sem resultados filtrados nesta página → não insistir; senão confiar no hasMore da API
-      setHasMoreTracks(page.tracks.length > 0 ? page.hasMore : false)
-      setVisibleCount(merged.length)
-    } finally {
-      setIsLoadingMore(false)
-    }
+  function scrollToTracksSection() {
+    tracksSectionRef.current?.scrollIntoView({
+      behavior: 'smooth',
+      block: 'start',
+    })
   }
 
-  function handleShowLessTracks() {
-    setVisibleCount(Math.min(INITIAL_VISIBLE, loadedTracks.length))
+  function goToPage(page: number) {
+    const next = Math.min(totalPages, Math.max(1, page))
+    setShowAllTracks(false)
+    setCurrentPage(next)
+    scrollToTracksSection()
   }
 
   function handlePlayTrack(track: ArtistProfileTrack) {
     if (!artist) return
-    void playTrack(track, loadedTracks.length > 0 ? loadedTracks : artist.topTracks)
+    void playTrack(track, allTracks.length > 0 ? allTracks : artist.topTracks)
   }
 
   function handlePlayAll() {
-    const queue = loadedTracks.length > 0 ? loadedTracks : artist?.topTracks ?? []
+    const queue = allTracks.length > 0 ? allTracks : artist?.topTracks ?? []
     const first = queue[0]
     if (!first || !artist) return
     void playTrack(first, queue)
@@ -219,11 +235,9 @@ export function Artist() {
           <div className="absolute inset-0 bg-gradient-to-br from-[#111827] to-[#0B0F19]" />
         )}
 
-        {/* Gradiente suave — capa nítida, texto legível */}
         <div className="absolute inset-0 bg-gradient-to-t from-[#0B0F19] via-[#0B0F19]/40 to-black/30" />
 
-        {/* Conteúdo do Header */}
-        <div className="absolute bottom-0 z-10 flex w-full flex-col items-center gap-5 p-6 text-center md:flex-row md:items-end md:gap-6 md:p-10 md:text-left">
+        <div className="absolute bottom-0 z-10 flex w-full flex-col items-center gap-4 px-4 text-center sm:flex-row sm:items-end sm:gap-6 sm:text-left md:gap-6 md:px-8 md:pb-6">
           {avatarUrl ? (
             <img
               src={avatarUrl}
@@ -236,22 +250,22 @@ export function Artist() {
             </div>
           )}
 
-          <div className="min-w-0 flex-1">
-            <div className="mb-2 flex items-center justify-center gap-2 md:justify-start">
+          <div className="min-w-0 flex-1 pb-4 sm:pb-0">
+            <div className="mb-2 flex items-center justify-center gap-2 sm:justify-start">
               <span className="rounded-full border border-cyan-500/30 bg-[#111827]/80 px-3 py-1 text-xs font-bold uppercase tracking-wider text-cyan-400 backdrop-blur-sm">
                 Artista Verificado
               </span>
             </div>
 
-            <h1 className="mb-5 line-clamp-2 text-4xl font-bold tracking-tight text-white md:text-6xl">
+            <h1 className="mb-5 line-clamp-2 text-2xl font-bold tracking-tight text-white sm:text-4xl md:text-5xl">
               {artist.name}
             </h1>
 
-            <div className="flex items-center justify-center gap-4 md:justify-start">
+            <div className="flex items-center justify-center gap-4 sm:justify-start">
               <button
                 type="button"
                 onClick={handlePlayAll}
-                disabled={artist.topTracks.length === 0}
+                disabled={allTracks.length === 0}
                 aria-label="Tocar faixas em destaque"
                 className="flex h-14 w-14 items-center justify-center rounded-full bg-cyan-400 text-black shadow-[0_0_15px_rgba(0,229,255,0.4)] transition-transform hover:scale-105 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:scale-100"
               >
@@ -278,33 +292,40 @@ export function Artist() {
       </div>
 
       {/* 2. GRID PRINCIPAL DE CONTEÚDO */}
-      <div className="mx-auto max-w-[1600px] p-6 md:p-10">
-        <div className="grid grid-cols-1 gap-8 md:gap-12 lg:grid-cols-3">
+      <div className="mx-auto max-w-[1600px] px-4 py-6 md:px-8 md:py-8">
+        <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
           <div className="lg:col-span-2">
             {/* 1. FAIXAS EM DESTAQUE */}
-            <div className="mb-6 flex flex-wrap items-end justify-between gap-3">
+            <div
+              ref={tracksSectionRef}
+              className="mb-6 flex flex-wrap items-end justify-between gap-3 scroll-mt-4"
+            >
               <h2 className="text-2xl font-bold text-white">
                 Faixas em Destaque
               </h2>
-              {loadedTracks.length > 0 && (
-                <p className="text-sm text-gray-400">
-                  Mostrando {visibleTracks.length}{' '}
-                  {visibleTracks.length === 1 ? 'música' : 'músicas'}
-                  {loadedTracks.length > visibleTracks.length
-                    ? ` · ${loadedTracks.length} carregadas`
-                    : null}
+              {loadedCount > 0 && (
+                <p className="flex items-center gap-2 text-sm text-gray-400">
+                  {isLoadingTracks && (
+                    <Loader2
+                      className="h-3.5 w-3.5 animate-spin text-cyan-400"
+                      strokeWidth={ICON_STROKE}
+                    />
+                  )}
+                  {showAllTracks
+                    ? `Mostrando 1–${loadedCount} de ${displayTrackCount} músicas`
+                    : `Mostrando ${startIndex + 1}–${Math.min(endIndex, allTracks.length)} de ${displayTrackCount} músicas`}
                 </p>
               )}
             </div>
 
-            {loadedTracks.length > 0 ? (
+            {loadedCount > 0 ? (
               <>
                 <div className="flex flex-col gap-2">
                   {visibleTracks.map((track, index) => (
                     <TrackRow
-                      key={`${track.id}-${index}`}
+                      key={`${track.id}-${startIndex + index}`}
                       track={track}
-                      index={index}
+                      index={startIndex + index}
                       variant="featured"
                       artistsFallback={artist.name}
                       onPlay={() => handlePlayTrack(track)}
@@ -312,52 +333,98 @@ export function Artist() {
                   ))}
                 </div>
 
-                <div className="mt-4 flex flex-col items-center gap-2">
-                  {(hasMoreTracks || visibleCount < loadedTracks.length) && (
-                    <button
-                      type="button"
-                      onClick={() => void handleLoadMoreTracks()}
-                      disabled={isLoadingMore}
-                      className="mx-auto mt-4 flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-5 py-2.5 text-sm text-gray-200 transition-all hover:border-cyan-400/50 hover:bg-cyan-500/10 hover:text-cyan-400 disabled:cursor-not-allowed disabled:opacity-60"
-                    >
-                      {isLoadingMore ? (
-                        <>
-                          <Loader2
-                            className="h-4 w-4 animate-spin"
-                            strokeWidth={ICON_STROKE}
-                          />
-                          A carregar…
-                        </>
-                      ) : (
-                        <>
-                          <ChevronDown
-                            className="h-4 w-4"
-                            strokeWidth={ICON_STROKE}
-                          />
-                          Carregar mais músicas
-                        </>
-                      )}
-                    </button>
-                  )}
+                {showPagination && (
+                  <div className="mt-6 flex flex-col items-center gap-3">
+                    <div className="flex flex-wrap items-center justify-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => goToPage(safePage - 1)}
+                        disabled={safePage <= 1}
+                        className="inline-flex items-center gap-1 rounded-full border border-white/10 bg-white/5 px-3.5 py-2 text-sm text-gray-300 transition-colors hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-40"
+                      >
+                        <ChevronLeft
+                          className="h-4 w-4"
+                          strokeWidth={ICON_STROKE}
+                        />
+                        Anterior
+                      </button>
 
-                  {isExpanded && (
+                      {pageNumbers.map((page, idx) => {
+                        const prev = pageNumbers[idx - 1]
+                        const showEllipsis =
+                          prev != null && page - prev > 1
+                        const isActive = page === safePage
+
+                        return (
+                          <span key={page} className="contents">
+                            {showEllipsis && (
+                              <span className="px-1 text-sm text-gray-500">
+                                …
+                              </span>
+                            )}
+                            <button
+                              type="button"
+                              onClick={() => goToPage(page)}
+                              className={`min-w-9 rounded-full px-3 py-2 text-sm transition-all ${
+                                isActive
+                                  ? 'bg-cyan-400 font-bold text-[#080B12] shadow-[0_0_15px_rgba(34,211,238,0.4)]'
+                                  : 'border border-white/10 bg-white/5 text-gray-300 hover:bg-white/10'
+                              }`}
+                            >
+                              {page}
+                            </button>
+                          </span>
+                        )
+                      })}
+
+                      <button
+                        type="button"
+                        onClick={() => goToPage(safePage + 1)}
+                        disabled={safePage >= totalPages}
+                        className="inline-flex items-center gap-1 rounded-full border border-white/10 bg-white/5 px-3.5 py-2 text-sm text-gray-300 transition-colors hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-40"
+                      >
+                        Próxima
+                        <ChevronRight
+                          className="h-4 w-4"
+                          strokeWidth={ICON_STROKE}
+                        />
+                      </button>
+                    </div>
+
                     <button
                       type="button"
-                      onClick={handleShowLessTracks}
-                      className="mt-1 flex items-center gap-1.5 text-xs text-gray-500 transition-colors hover:text-gray-300"
+                      onClick={() => {
+                        setShowAllTracks(true)
+                        scrollToTracksSection()
+                      }}
+                      className="text-xs font-medium text-gray-500 transition-colors hover:text-cyan-400"
                     >
-                      <ChevronUp
-                        className="h-3.5 w-3.5"
-                        strokeWidth={ICON_STROKE}
-                      />
-                      Mostrar menos
+                      Ver todas
                     </button>
-                  )}
-                </div>
+                  </div>
+                )}
+
+                {showAllTracks && loadedCount > TRACKS_PER_PAGE && (
+                  <div className="mt-4 flex justify-center">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowAllTracks(false)
+                        setCurrentPage(1)
+                        scrollToTracksSection()
+                      }}
+                      className="text-xs font-medium text-gray-500 transition-colors hover:text-cyan-400"
+                    >
+                      Paginar lista
+                    </button>
+                  </div>
+                )}
               </>
             ) : (
               <p className="text-gray-400">
-                Nenhuma faixa em destaque encontrada.
+                {isLoadingTracks
+                  ? 'A carregar músicas…'
+                  : 'Nenhuma faixa em destaque encontrada.'}
               </p>
             )}
 
@@ -417,7 +484,6 @@ export function Artist() {
                 Resumo do Artista
               </h3>
 
-              {/* Métricas estilo SoundCloud */}
               <div className="grid grid-cols-3 gap-3">
                 <div className="min-w-0">
                   <p className="text-xl font-bold text-white">
@@ -432,7 +498,7 @@ export function Artist() {
                 </div>
                 <div className="min-w-0">
                   <p className="text-xl font-bold text-white">
-                    {artist.totalTracksCount ?? artist.topTracks?.length ?? 0}
+                    {displayTrackCount}
                   </p>
                   <p className="mt-0.5 text-xs uppercase text-gray-400">
                     Músicas
@@ -448,7 +514,6 @@ export function Artist() {
                 </div>
               </div>
 
-              {/* Barra de popularidade / alcance */}
               <div className="mt-5">
                 <div className="mb-2 flex items-center justify-between">
                   <span className="text-xs uppercase text-gray-400">
@@ -468,7 +533,6 @@ export function Artist() {
                 </div>
               </div>
 
-              {/* Biografia */}
               {artist.description ? (
                 <div className="mt-4 border-t border-white/5 pt-4">
                   <p
@@ -490,7 +554,6 @@ export function Artist() {
                 </div>
               ) : null}
 
-              {/* Localização */}
               {artist.location ? (
                 <p className="mt-3 flex items-center gap-1.5 text-xs text-gray-400">
                   <MapPin className="h-3.5 w-3.5 shrink-0" strokeWidth={ICON_STROKE} />
@@ -498,7 +561,6 @@ export function Artist() {
                 </p>
               ) : null}
 
-              {/* Géneros */}
               {artist.genres && artist.genres.length > 0 ? (
                 <div className="mt-3 flex flex-wrap gap-1.5">
                   {artist.genres.slice(0, 6).map((genre) => (

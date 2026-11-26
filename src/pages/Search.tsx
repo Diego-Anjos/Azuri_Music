@@ -1,6 +1,6 @@
-import { Play, Search as SearchIcon } from 'lucide-react'
+import { Play, Search as SearchIcon, User } from 'lucide-react'
 import { useEffect, useState } from 'react'
-import { Link } from 'react-router-dom'
+import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { PlaylistCard } from '../components/PlaylistCard'
 import {
   searchCatalog,
@@ -25,12 +25,20 @@ const emptyResults: SpotifyCatalogSearchResult = {
 
 export function Search() {
   const playTrack = usePlayerStore((state) => state.playTrack)
-  const [query, setQuery] = useState('')
-  const [debouncedQuery, setDebouncedQuery] = useState('')
+  const [searchParams] = useSearchParams()
+  const initialQuery = searchParams.get('q')?.trim() ?? ''
+  const [query, setQuery] = useState(initialQuery)
+  const [debouncedQuery, setDebouncedQuery] = useState(initialQuery)
   const [results, setResults] =
     useState<SpotifyCatalogSearchResult>(emptyResults)
   const [isLoading, setIsLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    const fromUrl = searchParams.get('q')?.trim() ?? ''
+    setQuery(fromUrl)
+    setDebouncedQuery(fromUrl)
+  }, [searchParams])
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -126,6 +134,7 @@ export function Search() {
 
         {debouncedQuery && !isLoading && !error && hasResults && (
           <>
+            <ArtistsSection artists={results.artists} />
             <TracksSection
               tracks={results.tracks}
               onPlay={(track) =>
@@ -135,7 +144,6 @@ export function Search() {
                 )
               }
             />
-            <ArtistsSection artists={results.artists} />
             <PlaylistsSection playlists={results.playlists} />
           </>
         )}
@@ -254,35 +262,46 @@ function TracksSection({
 }
 
 function ArtistsSection({ artists }: { artists: SpotifyArtist[] }) {
+  const navigate = useNavigate()
+
   if (artists.length === 0) return null
 
   return (
     <section>
-      <h3 className="mb-3 text-xl font-bold text-[#F8FAFC]">Artistas</h3>
-      <div className="-mx-1 flex gap-4 overflow-x-auto px-1 pb-2">
+      <h3 className="mb-4 text-xl font-bold text-[#F8FAFC]">Artistas</h3>
+      <div className="mb-8 grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 md:gap-4 lg:grid-cols-5">
         {artists.map((artist) => (
-          <Link
+          <button
             key={artist.id}
-            to={`/artist/${artist.id}`}
-            state={{ artistName: artist.name }}
-            className="w-36 shrink-0 rounded-lg bg-white/5 p-4 text-center transition-colors hover:bg-white/10 focus:outline-none focus-visible:ring-2 focus-visible:ring-[#00E5FF] sm:w-40"
+            type="button"
+            onClick={() =>
+              navigate(`/artist/${artist.id}`, {
+                state: { artistName: artist.name },
+              })
+            }
+            className="group flex cursor-pointer flex-col items-center rounded-2xl border border-white/5 bg-[#111827]/70 p-4 text-center transition-all hover:border-cyan-400/40 hover:bg-[#1E293B]/90 focus:outline-none focus-visible:ring-2 focus-visible:ring-[#00E5FF]"
           >
             {artist.imageUrl ? (
               <img
                 src={artist.imageUrl}
                 alt={artist.name}
-                className="mx-auto mb-3 size-28 rounded-full object-cover shadow-lg shadow-black/40 sm:size-32"
+                className="mb-3 h-28 w-28 rounded-full object-cover shadow-xl transition-transform group-hover:scale-105"
               />
             ) : (
-              <div className="mx-auto mb-3 flex size-28 items-center justify-center rounded-full bg-[#111827] text-xs text-[#94A3B8] sm:size-32">
-                Sem foto
+              <div className="mb-3 flex h-28 w-28 items-center justify-center rounded-full bg-[#0B0F19] shadow-xl transition-transform group-hover:scale-105">
+                <User
+                  className="size-10 text-[#94A3B8]"
+                  strokeWidth={ICON_STROKE}
+                />
               </div>
             )}
-            <h4 className="truncate text-sm font-semibold text-[#F8FAFC]">
+            <h4 className="w-full truncate font-bold text-white group-hover:text-cyan-400">
               {artist.name}
             </h4>
-            <p className="mt-1 text-xs text-[#94A3B8]">Artista</p>
-          </Link>
+            <span className="mt-1 inline-flex items-center rounded-full border border-cyan-400/30 bg-cyan-400/10 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-cyan-400">
+              Artista
+            </span>
+          </button>
         ))}
       </div>
     </section>

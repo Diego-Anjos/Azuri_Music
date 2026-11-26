@@ -19,6 +19,8 @@ build/
 .vite/
 .turbo
 .next
+cache/*
+!cache/.gitkeep
 
 # Logs
 logs/

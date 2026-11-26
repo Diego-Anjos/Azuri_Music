@@ -121,7 +121,7 @@ export function Album() {
         )}
         <div className="absolute inset-0 bg-gradient-to-t from-[#0B0F19] via-[#0B0F19]/85 to-transparent" />
 
-        <div className="relative z-10 mx-auto flex max-w-[1600px] flex-col items-center gap-5 px-6 pb-8 pt-4 text-center md:flex-row md:items-end md:gap-8 md:px-10 md:pb-10 md:pt-4 md:text-left">
+        <div className="relative z-10 mx-auto flex max-w-[1600px] flex-col items-center gap-4 px-4 pb-8 pt-4 text-center sm:flex-row sm:items-end sm:gap-6 sm:text-left md:gap-6 md:px-8 md:pb-10">
           {coverUrl ? (
             <img
               src={coverUrl}
@@ -139,11 +139,11 @@ export function Album() {
               {albumTypeLabel(album.album_type)}
             </span>
 
-            <h1 className="mb-3 line-clamp-2 text-4xl font-black tracking-tight text-white md:text-6xl">
+            <h1 className="mb-3 line-clamp-2 text-2xl font-black tracking-tight text-white sm:text-4xl md:text-5xl">
               {album.name}
             </h1>
 
-            <div className="flex flex-wrap items-center justify-center gap-x-2 gap-y-2 text-sm font-medium text-gray-300 md:justify-start">
+            <div className="flex flex-wrap items-center justify-center gap-x-2 gap-y-2 text-sm font-medium text-gray-300 sm:justify-start">
               {primaryArtist && (
                 <span className="flex items-center gap-2">
                   <span className="flex h-6 w-6 items-center justify-center overflow-hidden rounded-full border border-white/10 bg-cyan-400/20 text-[10px] font-bold text-cyan-400">
@@ -193,7 +193,7 @@ export function Album() {
       </div>
 
       {/* AÇÕES + LAYOUT 2 COLUNAS */}
-      <div className="mx-auto max-w-[1600px] px-6 md:px-10">
+      <div className="mx-auto max-w-[1600px] px-4 md:px-8">
         <div className="flex flex-wrap items-center gap-4 py-6">
           <button
             type="button"
@@ -265,7 +265,7 @@ export function Album() {
           </button>
         </div>
 
-        <div className="mt-2 grid grid-cols-1 gap-8 pb-10 lg:grid-cols-3">
+        <div className="mt-2 grid grid-cols-1 gap-6 pb-10 lg:grid-cols-3">
           {/* LISTA DE FAIXAS */}
           <div className="lg:col-span-2">
             <h2 className="mb-5 text-2xl font-bold text-white">Faixas</h2>

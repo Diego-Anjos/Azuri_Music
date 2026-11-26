@@ -1,67 +1,173 @@
+import { RefreshCw } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { MainContent } from '../components/layout/MainContent'
 import { RightSidebar } from '../components/layout/RightSidebar'
 import {
-  searchPlaylistsByQuery,
-  type SpotifyPlaylist,
-} from '../services/spotify'
+  getPlaylists,
+  getRecentPlays,
+  subscribeLibraryUpdates,
+  type RecentPlayItem,
+  type UserPlaylist,
+} from '../services/libraryStorage'
+import {
+  clearHomeRecommendationsCache,
+  getPersonalizedHomeData,
+  type BecauseYouListened,
+  type FeaturedRelease,
+  type PersonalizedMix,
+  type SuggestedArtist,
+} from '../services/recommendationService'
+import type { SpotifyTrack } from '../services/spotify'
+import {
+  PROFILE_UPDATED_EVENT,
+  getUserProfile,
+  subscribeProfileUpdates,
+} from '../services/userProfileService'
+
+function formatProfileHandle(handle?: string): string {
+  if (!handle) return '@usuario'
+  return handle.startsWith('@') ? handle : `@${handle}`
+}
 
 export function Home() {
-  const [recentPlaylists, setRecentPlaylists] = useState<SpotifyPlaylist[]>([])
-  const [mixPlaylists, setMixPlaylists] = useState<SpotifyPlaylist[]>([])
-  const [electronicPlaylists, setElectronicPlaylists] = useState<
-    SpotifyPlaylist[]
-  >([])
+  const [libraryPlaylists, setLibraryPlaylists] = useState<UserPlaylist[]>(() =>
+    getPlaylists(),
+  )
+  const [recentPlays, setRecentPlays] = useState<RecentPlayItem[]>(() =>
+    getRecentPlays(12),
+  )
+  const [featuredRelease, setFeaturedRelease] =
+    useState<FeaturedRelease | null>(null)
+  const [personalizedMixes, setPersonalizedMixes] = useState<PersonalizedMix[]>(
+    [],
+  )
+  const [becauseYouListened, setBecauseYouListened] =
+    useState<BecauseYouListened | null>(null)
+  const [suggestedArtists, setSuggestedArtists] = useState<SuggestedArtist[]>(
+    [],
+  )
+  const [newTracks, setNewTracks] = useState<SpotifyTrack[]>([])
+  const [genresKey, setGenresKey] = useState(() =>
+    getUserProfile().favoriteGenres.join('|'),
+  )
+  const [formattedHandle, setFormattedHandle] = useState(() =>
+    formatProfileHandle(getUserProfile().handle),
+  )
   const [isLoading, setIsLoading] = useState(true)
+  const [isRefreshing, setIsRefreshing] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [reloadToken, setReloadToken] = useState(0)
+
+  useEffect(() => {
+    return subscribeLibraryUpdates(() => {
+      setLibraryPlaylists(getPlaylists())
+      setRecentPlays(getRecentPlays(12))
+    })
+  }, [])
+
+  useEffect(() => {
+    const syncProfile = () => {
+      const profile = getUserProfile()
+      setFormattedHandle(formatProfileHandle(profile.handle))
+      const next = profile.favoriteGenres.join('|')
+      setGenresKey((prev) => {
+        if (prev !== next) {
+          clearHomeRecommendationsCache()
+        }
+        return next
+      })
+    }
+
+    syncProfile()
+    window.addEventListener(PROFILE_UPDATED_EVENT, syncProfile)
+    const unsubscribe = subscribeProfileUpdates(syncProfile)
+    return () => {
+      window.removeEventListener(PROFILE_UPDATED_EVENT, syncProfile)
+      unsubscribe()
+    }
+  }, [])
 
   useEffect(() => {
     let cancelled = false
 
-    async function loadHomePlaylists() {
+    async function run() {
       try {
-        setIsLoading(true)
+        if (reloadToken > 0) {
+          setIsRefreshing(true)
+          clearHomeRecommendationsCache()
+        } else {
+          setIsLoading(true)
+        }
         setError(null)
 
-        const [recent, mix, electronic] = await Promise.all([
-          searchPlaylistsByQuery('Hip-Rock OR Nu Metal', 6),
-          searchPlaylistsByQuery('Vocaloid OR Hatsune Miku', 5),
-          searchPlaylistsByQuery('Electronic OR Synthwave', 5),
-        ])
+        const data = await getPersonalizedHomeData({
+          forceRefresh: reloadToken > 0,
+        })
 
         if (cancelled) return
 
-        setRecentPlaylists(recent)
-        setMixPlaylists(mix)
-        setElectronicPlaylists(electronic)
+        setFeaturedRelease(data.featuredRelease)
+        setPersonalizedMixes(data.personalizedMixes)
+        setBecauseYouListened(data.becauseYouListened)
+        setSuggestedArtists(data.suggestedArtists)
+        setNewTracks(data.newTracks)
       } catch (err) {
         if (!cancelled) {
           setError(
-            err instanceof Error ? err.message : 'Erro ao carregar playlists',
+            err instanceof Error
+              ? err.message
+              : 'Erro ao carregar recomendações',
           )
         }
       } finally {
-        if (!cancelled) setIsLoading(false)
+        if (!cancelled) {
+          setIsLoading(false)
+          setIsRefreshing(false)
+        }
       }
     }
 
-    loadHomePlaylists()
+    void run()
 
     return () => {
       cancelled = true
     }
-  }, [])
+  }, [genresKey, reloadToken])
 
   return (
     <div className="flex min-h-0 min-w-0 flex-1">
       <MainContent
-        recentPlaylists={recentPlaylists}
-        mixPlaylists={mixPlaylists}
-        electronicPlaylists={electronicPlaylists}
+        libraryPlaylists={libraryPlaylists}
+        recentPlays={recentPlays}
+        featuredRelease={featuredRelease}
+        personalizedMixes={personalizedMixes}
+        becauseYouListened={becauseYouListened}
+        suggestedArtists={suggestedArtists}
+        newTracks={newTracks}
         isLoading={isLoading}
         error={error}
+        userHandle={formattedHandle}
+        refreshControl={
+          <button
+            type="button"
+            onClick={() => setReloadToken((n) => n + 1)}
+            disabled={isLoading || isRefreshing}
+            className="inline-flex shrink-0 items-center gap-1.5 rounded-full border border-white/10 bg-white/5 px-3 py-1 text-[11px] font-medium text-[#94A3B8] transition-colors hover:border-cyan-400/30 hover:text-cyan-300 disabled:opacity-50"
+            aria-label="Atualizar recomendações"
+          >
+            <RefreshCw
+              className={`size-3 ${isRefreshing ? 'animate-spin' : ''}`}
+              strokeWidth={1.5}
+            />
+            Atualizar
+          </button>
+        }
       />
-      <RightSidebar />
+      <RightSidebar
+        variant="rail"
+        artists={suggestedArtists}
+        newTracks={newTracks.slice(0, 6)}
+      />
     </div>
   )
 }
