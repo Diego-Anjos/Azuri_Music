@@ -1,6 +1,7 @@
 import {
   CheckCircle2,
   ChevronDown,
+  Clapperboard,
   Crosshair,
   ExternalLink,
   Mic2,
@@ -143,13 +144,21 @@ function readAudioClock(
   })
 }
 
-export function LyricsView() {
+type LyricsViewProps = {
+  /** Painel embutido no Modo Vídeo (Clipe + Letra) — sem overlay fullscreen. */
+  embedded?: boolean
+}
+
+export function LyricsView({ embedded = false }: LyricsViewProps) {
   const currentTrack = usePlayerStore((s) => s.currentTrack)
   const progress = usePlayerStore((s) => s.progress)
   const duration = usePlayerStore((s) => s.duration)
   const isPlaying = usePlayerStore((s) => s.isPlaying)
   const seekTo = usePlayerStore((s) => s.seekTo)
   const closeLyrics = usePlayerStore((s) => s.closeLyrics)
+  const setVideoMode = usePlayerStore((s) => s.setVideoMode)
+  const setVideoDisplayMode = usePlayerStore((s) => s.setVideoDisplayMode)
+  const isVideoMode = usePlayerStore((s) => s.isVideoMode)
 
   const [lyrics, setLyrics] = useState<LyricsResult | null>(null)
   const [loading, setLoading] = useState(false)
@@ -851,19 +860,39 @@ export function LyricsView() {
   const showManualFallback =
     Boolean(currentTrack) && !loading && !hasSyncedVerses
 
+  async function handleOpenVideoClip() {
+    closeLyrics()
+    if (!isVideoMode) {
+      await setVideoMode(true)
+    }
+    setVideoDisplayMode('split-lyrics')
+  }
+
   return (
-    <div className="fixed top-0 right-0 bottom-30 left-0 z-40 flex flex-col overflow-hidden bg-[#080B12]/98 backdrop-blur-2xl md:left-60 md:bottom-20 lg:left-64">
-      {coverUrl && (
+    <div
+      className={
+        embedded
+          ? 'relative flex h-full min-h-0 flex-col overflow-hidden bg-[#080B12]/60'
+          : 'fixed top-0 right-0 bottom-30 left-0 z-40 flex flex-col overflow-hidden bg-[#080B12]/98 backdrop-blur-2xl md:left-60 md:bottom-20 lg:left-64'
+      }
+    >
+      {coverUrl && !embedded && (
         <div
           className="pointer-events-none absolute inset-0 scale-110 bg-cover bg-center opacity-25 blur-3xl"
           style={{ backgroundImage: `url(${coverUrl})` }}
           aria-hidden
         />
       )}
-      <div className="pointer-events-none absolute inset-0 bg-[#080B12]/80" />
+      {!embedded && (
+        <div className="pointer-events-none absolute inset-0 bg-[#080B12]/80" />
+      )}
 
       {/* Cabeçalho fixo — nunca rola com as letras */}
-      <header className="relative z-20 shrink-0 border-b border-white/10 bg-[#080B12]/95 px-4 pt-4 pb-3 sm:px-8 sm:pt-5">
+      <header
+        className={`relative z-20 shrink-0 border-b border-white/10 bg-[#080B12]/95 ${
+          embedded ? 'px-3 pt-3 pb-2' : 'px-4 pt-4 pb-3 sm:px-8 sm:pt-5'
+        }`}
+      >
         <div className="flex items-center gap-3">
           {coverUrl ? (
             <img
@@ -886,16 +915,34 @@ export function LyricsView() {
             </p>
           </div>
 
-          <button
-            type="button"
-            onClick={closeLyrics}
-            title="Fechar letras (Esc)"
-            aria-label="Fechar letras"
-            className="flex shrink-0 cursor-pointer items-center gap-1.5 rounded-full border border-white/10 bg-white/10 px-3.5 py-2 text-white transition-all hover:border-cyan-400/50 hover:bg-cyan-500/20 hover:text-cyan-300"
-          >
-            <ChevronDown className="size-4" strokeWidth={ICON_STROKE} />
-            <span className="text-xs font-semibold">Fechar</span>
-          </button>
+          {!embedded && (
+            <button
+              type="button"
+              onClick={() => void handleOpenVideoClip()}
+              title="Ver clipe com letra"
+              aria-label="Ver clipe"
+              disabled={!currentTrack}
+              className="flex shrink-0 cursor-pointer items-center gap-1.5 rounded-full border border-cyan-400/30 bg-cyan-400/10 px-3 py-2 text-cyan-300 transition-all hover:border-cyan-400/60 hover:bg-cyan-500/20 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              <Clapperboard className="size-4" strokeWidth={ICON_STROKE} />
+              <span className="hidden text-xs font-semibold sm:inline">
+                Ver Clipe
+              </span>
+            </button>
+          )}
+
+          {!embedded && (
+            <button
+              type="button"
+              onClick={closeLyrics}
+              title="Fechar letras (Esc)"
+              aria-label="Fechar letras"
+              className="flex shrink-0 cursor-pointer items-center gap-1.5 rounded-full border border-white/10 bg-white/10 px-3.5 py-2 text-white transition-all hover:border-cyan-400/50 hover:bg-cyan-500/20 hover:text-cyan-300"
+            >
+              <ChevronDown className="size-4" strokeWidth={ICON_STROKE} />
+              <span className="text-xs font-semibold">Fechar</span>
+            </button>
+          )}
         </div>
 
         {backendOffline && (

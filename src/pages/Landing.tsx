@@ -1,15 +1,13 @@
-import {
+﻿import {
   AudioWaveform,
   BadgeCheck,
   Ban,
-  Check,
   Disc3,
   EyeOff,
   HardDrive,
   Headphones,
   Heart,
   History,
-  ListMusic,
   MessageCircle,
   Mic2,
   Music,
@@ -33,22 +31,17 @@ import {
   type FormEvent,
   type ReactNode,
 } from 'react'
-import { Link, useNavigate } from 'react-router-dom'
+import { Link, useLocation, useNavigate } from 'react-router-dom'
 import {
-  authenticateUser,
-  getAccountIntentLabel,
-  isUserAuthenticated,
-  maskCpf,
-  MOCK_AUTH_PROFILE,
-  registerUser,
-  type AccountIntent,
-} from '../services/userProfileService'
+  AuthModal,
+  type AuthMode,
+  type InfoModalKey,
+} from '../components/AuthModal'
+import { useAuth } from '../contexts/AuthContext'
 
 const ICON_STROKE = 1.5
 
-type AuthMode = 'login' | 'signup'
 type DevicePreview = 'desktop' | 'mobile'
-type InfoModalKey = 'sobre' | 'artistas' | 'diretrizes' | 'privacidade' | 'termos'
 
 type FooterModalTopic = {
   icon: LucideIcon
@@ -208,6 +201,8 @@ const FOOTER_MODAL_CONTENT: Record<InfoModalKey, FooterModalContent> = {
 
 export function Landing() {
   const navigate = useNavigate()
+  const location = useLocation()
+  const { isAuthenticated, isLoading } = useAuth()
   const [preview, setPreview] = useState<DevicePreview>('desktop')
   const [searchQuery, setSearchQuery] = useState('')
   const [authOpen, setAuthOpen] = useState(false)
@@ -216,20 +211,28 @@ export function Landing() {
     null,
   )
 
+  // Deep-link de rota protegida: abre AuthModal na aba de login.
   useEffect(() => {
-    if (isUserAuthenticated()) {
+    const state = location.state as { openAuth?: AuthMode } | null
+    if (!state?.openAuth) return
+    setAuthMode(state.openAuth === 'signup' ? 'signup' : 'login')
+    setAuthOpen(true)
+    navigate(location.pathname, { replace: true, state: {} })
+  }, [location.pathname, location.state, navigate])
+
+  useEffect(() => {
+    if (!isLoading && isAuthenticated) {
       navigate('/home', { replace: true })
     }
-  }, [navigate])
-
-  function enterApp(path = '/home') {
-    authenticateUser()
-    navigate(path)
-  }
+  }, [isAuthenticated, isLoading, navigate])
 
   function openAuth(mode: AuthMode) {
     setAuthMode(mode)
     setAuthOpen(true)
+  }
+
+  function requireAuth(mode: AuthMode = 'login') {
+    openAuth(mode)
   }
 
   function closeInfoModal() {
@@ -240,8 +243,7 @@ export function Landing() {
     event.preventDefault()
     const q = searchQuery.trim()
     if (!q) return
-    authenticateUser()
-    navigate(`/search?q=${encodeURIComponent(q)}`)
+    requireAuth('login')
   }
 
   function scrollTo(id: string) {
@@ -325,7 +327,7 @@ export function Landing() {
             </button>
             <button
               type="button"
-              onClick={() => enterApp('/studio/upload')}
+              onClick={() => requireAuth('signup')}
               className="hidden items-center gap-1.5 text-xs text-gray-500 transition-colors hover:text-cyan-400 sm:inline-flex"
             >
               <UploadCloud className="h-3.5 w-3.5" strokeWidth={ICON_STROKE} />
@@ -489,7 +491,7 @@ export function Landing() {
             </button>
             <button
               type="button"
-              onClick={() => enterApp('/home')}
+              onClick={() => requireAuth('login')}
               className="text-sm text-gray-400 underline-offset-4 transition-colors hover:text-cyan-400 hover:underline"
             >
               Ou explorar sem conta
@@ -505,7 +507,7 @@ export function Landing() {
             title="Mais faixas do momento. Mais da cena underground."
             body="Explore catálogos completos, descubra novos produtores e ouça com visualizador de ondas sonoras em tempo real."
             linkLabel="Explorar catálogo →"
-            onLink={() => enterApp('/search')}
+            onLink={() => requireAuth('login')}
           />
           <PhoneShell>
             <CatalogPhoneScreen />
@@ -526,7 +528,7 @@ export function Landing() {
               title="Letras sincronizadas. Sinta cada verso ao vivo."
               body="Acompanhe a letra linha por linha no ritmo exato da batida, com ajuste fino de tempo e modo karaoke imersivo."
               linkLabel="Testar letras ao vivo →"
-              onLink={() => enterApp('/home')}
+              onLink={() => requireAuth('login')}
             />
           </div>
         </section>
@@ -539,7 +541,7 @@ export function Landing() {
             title="Mais curtidas. Mais playlists. E espaço para sua arte."
             body="Monte suas playlists, siga seus artistas favoritos ou publique seus próprios singles e álbuns no Azuri Studio."
             linkLabel="Acessar Estúdio →"
-            onLink={() => enterApp('/studio/upload')}
+            onLink={() => requireAuth('signup')}
           />
           <PhoneShell>
             <StudioPhoneScreen />
@@ -606,15 +608,17 @@ export function Landing() {
         </div>
       </footer>
 
-      {authOpen && (
-        <AuthModal
-          mode={authMode}
-          onModeChange={setAuthMode}
-          onClose={() => setAuthOpen(false)}
-          onSuccess={() => navigate('/home')}
-          onOpenInfo={(key) => setActiveInfoModal(key)}
-        />
-      )}
+      <AuthModal
+        mode={authMode}
+        onModeChange={setAuthMode}
+        onClose={() => setAuthOpen(false)}
+        onSuccess={() => {
+          setAuthOpen(false)
+          navigate('/home')
+        }}
+        onOpenInfo={(key) => setActiveInfoModal(key)}
+        isOpen={authOpen}
+      />
 
       {activeInfoModal && (
         <InfoModal
@@ -622,7 +626,7 @@ export function Landing() {
           onClose={closeInfoModal}
           onStudioCta={() => {
             closeInfoModal()
-            enterApp('/studio/upload')
+            requireAuth('signup')
           }}
         />
       )}
@@ -1002,708 +1006,6 @@ function InfoModal({
             Fechar
           </button>
         </div>
-      </div>
-    </div>
-  )
-}
-
-const SIGNUP_GENRES = [
-  'Trap & Underground',
-  'Synthwave',
-  'Phonk',
-  'Hyperpop',
-  'Lo-Fi Beats',
-  'Hip-Hop / Rap',
-  'Rock & Nu-Metal',
-  'Eletrônica / House',
-  'R&B / Soul',
-  'Vocaloid / J-Core',
-  'Indie / Alternativo',
-  'Pop',
-] as const
-
-const ACCOUNT_INTENT_OPTIONS: {
-  id: AccountIntent
-  title: string
-  description: string
-  icon: LucideIcon
-}[] = [
-  {
-    id: 'listener',
-    title: 'Só ouvir e descobrir',
-    description:
-      'Explorar faixas, acompanhar letras sincronizadas e montar playlists.',
-    icon: Headphones,
-  },
-  {
-    id: 'creator',
-    title: 'Publicar minhas músicas',
-    description: 'Lançar singles, EPs e álbuns no Azuri Studio.',
-    icon: Mic2,
-  },
-  {
-    id: 'both',
-    title: 'Ouvir e publicar (Completo)',
-    description:
-      'Experiência completa como ouvinte e artista independente.',
-    icon: Sparkles,
-  },
-  {
-    id: 'curator',
-    title: 'Curadoria e Playlists',
-    description: 'Descobrir talentos underground e organizar coleções.',
-    icon: ListMusic,
-  },
-]
-
-function formatCpfMask(value: string): string {
-  const digits = value.replace(/\D/g, '').slice(0, 11)
-  return digits
-    .replace(/(\d{3})(\d)/, '$1.$2')
-    .replace(/(\d{3})(\d)/, '$1.$2')
-    .replace(/(\d{3})(\d{1,2})$/, '$1-$2')
-}
-
-function formatHandleInput(value: string): string {
-  const cleaned = value.replace(/^@+/, '').replace(/\s+/g, '')
-  if (!cleaned) return ''
-  return `@${cleaned}`
-}
-
-const authInputClass =
-  'w-full rounded-lg border border-white/10 bg-white/5 px-3.5 py-2.5 text-sm text-white outline-none transition-colors placeholder:text-gray-600 focus:border-cyan-400/60'
-
-function AuthModal({
-  mode,
-  onModeChange,
-  onClose,
-  onSuccess,
-  onOpenInfo,
-}: {
-  mode: AuthMode
-  onModeChange: (mode: AuthMode) => void
-  onClose: () => void
-  onSuccess: () => void
-  onOpenInfo: (key: InfoModalKey) => void
-}) {
-  const titleId = useId()
-  const [loginName, setLoginName] = useState(MOCK_AUTH_PROFILE.name)
-  const [loginEmail, setLoginEmail] = useState(MOCK_AUTH_PROFILE.email)
-
-  const [step, setStep] = useState(1)
-  const [firstName, setFirstName] = useState('')
-  const [lastName, setLastName] = useState('')
-  const [handle, setHandle] = useState('')
-  const [email, setEmail] = useState('')
-  const [birthDate, setBirthDate] = useState('')
-  const [cpf, setCpf] = useState('')
-  const [favoriteGenres, setFavoriteGenres] = useState<string[]>([])
-  const [accountIntent, setAccountIntent] = useState<AccountIntent | null>(null)
-  const [acceptedTerms, setAcceptedTerms] = useState(false)
-  const [stepError, setStepError] = useState('')
-
-  useEffect(() => {
-    function onKey(event: KeyboardEvent) {
-      if (event.key === 'Escape') onClose()
-    }
-    document.addEventListener('keydown', onKey)
-    return () => document.removeEventListener('keydown', onKey)
-  }, [onClose])
-
-  useEffect(() => {
-    setStepError('')
-    if (mode === 'login') setStep(1)
-  }, [mode])
-
-  function completeDemoLogin(override?: { name?: string; email?: string }) {
-    authenticateUser({
-      name: override?.name ?? loginName,
-      email: override?.email ?? loginEmail,
-    })
-    onSuccess()
-  }
-
-  function handleLoginSubmit(event: FormEvent) {
-    event.preventDefault()
-    completeDemoLogin()
-  }
-
-  function toggleGenre(genre: string) {
-    setFavoriteGenres((prev) =>
-      prev.includes(genre) ? prev.filter((g) => g !== genre) : [...prev, genre],
-    )
-  }
-
-  function validateStep1(): boolean {
-    const cpfDigits = cpf.replace(/\D/g, '')
-    if (
-      !firstName.trim() ||
-      !lastName.trim() ||
-      !handle.trim() ||
-      handle === '@' ||
-      !email.trim() ||
-      !birthDate ||
-      cpfDigits.length !== 11
-    ) {
-      setStepError(
-        'Preencha todos os campos. O CPF precisa ter 11 dígitos.',
-      )
-      return false
-    }
-    setStepError('')
-    return true
-  }
-
-  function goNextFromStep1() {
-    if (!validateStep1()) return
-    setStep(2)
-  }
-
-  function goNextFromStep2() {
-    if (favoriteGenres.length < 2) {
-      setStepError('Escolha pelo menos 2 gêneros.')
-      return
-    }
-    setStepError('')
-    setStep(3)
-  }
-
-  function goNextFromStep3() {
-    if (!accountIntent) {
-      setStepError('Selecione como você quer usar o Azuri.')
-      return
-    }
-    setStepError('')
-    setStep(4)
-  }
-
-  function handleRegisterSubmit(event: FormEvent) {
-    event.preventDefault()
-    if (!acceptedTerms || !accountIntent) return
-    if (!validateStep1() || favoriteGenres.length < 2) {
-      setStep(1)
-      return
-    }
-
-    registerUser({
-      firstName: firstName.trim(),
-      lastName: lastName.trim(),
-      handle,
-      email: email.trim(),
-      birthDate,
-      cpf,
-      favoriteGenres,
-      accountIntent,
-      acceptedTerms: true,
-    })
-    onSuccess()
-  }
-
-  const progressPct = (step / 4) * 100
-  const isSignup = mode === 'signup'
-
-  return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 px-4 py-6 backdrop-blur-sm"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby={titleId}
-      onClick={onClose}
-    >
-      <div
-        className={`max-h-[92vh] w-full overflow-y-auto rounded-2xl border border-white/10 bg-[#111827]/80 p-6 shadow-2xl backdrop-blur-xl ${
-          isSignup ? 'max-w-xl' : 'max-w-md'
-        }`}
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div className="mb-5 flex items-start justify-between gap-4">
-          <div className="flex min-w-0 items-start gap-3">
-            <img
-              src="/logo.png"
-              alt="Azuri Music"
-              className="mt-0.5 h-10 w-10 shrink-0 object-contain drop-shadow-[0_0_10px_rgba(34,211,238,0.4)]"
-            />
-            <div>
-              <h2 id={titleId} className="text-xl font-bold text-white">
-                {mode === 'login' ? 'Entrar' : 'Criar conta'}
-              </h2>
-              <p className="mt-1 text-sm text-gray-400">
-                {mode === 'login'
-                  ? 'Perfil demo pronto — um clique e você entra no Azuri.'
-                  : 'Cadastro completo em 4 etapas (salvo localmente).'}
-              </p>
-            </div>
-          </div>
-          <button
-            type="button"
-            aria-label="Fechar"
-            onClick={onClose}
-            className="rounded-full p-1.5 text-gray-400 transition-colors hover:bg-white/5 hover:text-white"
-          >
-            <X className="h-5 w-5" strokeWidth={ICON_STROKE} />
-          </button>
-        </div>
-
-        <div className="mb-5 flex gap-2 rounded-full border border-white/10 bg-white/5 p-1">
-          <button
-            type="button"
-            onClick={() => onModeChange('login')}
-            className={`flex-1 rounded-full px-3 py-2 text-sm font-medium transition-colors ${
-              mode === 'login'
-                ? 'bg-cyan-400 text-[#080B12]'
-                : 'text-gray-400 hover:text-white'
-            }`}
-          >
-            Entrar
-          </button>
-          <button
-            type="button"
-            onClick={() => onModeChange('signup')}
-            className={`flex-1 rounded-full px-3 py-2 text-sm font-medium transition-colors ${
-              mode === 'signup'
-                ? 'bg-cyan-400 text-[#080B12]'
-                : 'text-gray-400 hover:text-white'
-            }`}
-          >
-            Criar conta
-          </button>
-        </div>
-
-        {mode === 'login' ? (
-          <form onSubmit={handleLoginSubmit} className="space-y-4">
-            <label className="block">
-              <span className="mb-1.5 block text-xs font-medium text-gray-400">
-                Nome
-              </span>
-              <input
-                type="text"
-                value={loginName}
-                onChange={(e) => setLoginName(e.target.value)}
-                autoComplete="name"
-                className={authInputClass}
-                placeholder={MOCK_AUTH_PROFILE.name}
-              />
-            </label>
-
-            <label className="block">
-              <span className="mb-1.5 block text-xs font-medium text-gray-400">
-                E-mail
-              </span>
-              <input
-                type="email"
-                value={loginEmail}
-                onChange={(e) => setLoginEmail(e.target.value)}
-                autoComplete="email"
-                className={authInputClass}
-                placeholder={MOCK_AUTH_PROFILE.email}
-              />
-            </label>
-
-            <button
-              type="submit"
-              className="w-full rounded-full bg-cyan-400 py-3 text-sm font-bold text-[#080B12] transition-colors hover:bg-cyan-300"
-            >
-              Entrar agora
-            </button>
-
-            <button
-              type="button"
-              onClick={() =>
-                completeDemoLogin({
-                  name: MOCK_AUTH_PROFILE.name,
-                  email: MOCK_AUTH_PROFILE.email,
-                })
-              }
-              className="w-full text-center text-xs text-gray-500 transition-colors hover:text-cyan-400"
-            >
-              Entrar como Visitante (Modo Demo)
-            </button>
-          </form>
-        ) : (
-          <form onSubmit={handleRegisterSubmit} className="space-y-5">
-            <div>
-              <div className="mb-2 flex items-center justify-between gap-3">
-                <p className="text-xs font-medium uppercase tracking-[0.14em] text-cyan-300/90">
-                  Etapa {step} de 4
-                </p>
-                <p className="text-xs text-gray-500">{Math.round(progressPct)}%</p>
-              </div>
-              <div className="h-1.5 overflow-hidden rounded-full bg-white/10">
-                <div
-                  className="h-full rounded-full bg-cyan-400 transition-all duration-300"
-                  style={{ width: `${progressPct}%` }}
-                />
-              </div>
-            </div>
-
-            {step === 1 && (
-              <div className="space-y-3.5">
-                <p className="text-sm font-semibold text-white">
-                  Dados da Conta e Identidade
-                </p>
-                <div className="grid grid-cols-1 gap-3.5 sm:grid-cols-2">
-                  <label className="block">
-                    <span className="mb-1.5 block text-xs font-medium text-gray-400">
-                      Nome real
-                    </span>
-                    <input
-                      type="text"
-                      value={firstName}
-                      onChange={(e) => setFirstName(e.target.value)}
-                      autoComplete="given-name"
-                      className={authInputClass}
-                      placeholder="Diego"
-                    />
-                  </label>
-                  <label className="block">
-                    <span className="mb-1.5 block text-xs font-medium text-gray-400">
-                      Sobrenome real
-                    </span>
-                    <input
-                      type="text"
-                      value={lastName}
-                      onChange={(e) => setLastName(e.target.value)}
-                      autoComplete="family-name"
-                      className={authInputClass}
-                      placeholder="Anjos"
-                    />
-                  </label>
-                  <label className="block sm:col-span-2">
-                    <span className="mb-1.5 block text-xs font-medium text-gray-400">
-                      Nome de usuário
-                    </span>
-                    <input
-                      type="text"
-                      value={handle}
-                      onChange={(e) => setHandle(formatHandleInput(e.target.value))}
-                      autoComplete="username"
-                      className={authInputClass}
-                      placeholder="@username"
-                    />
-                  </label>
-                  <label className="block sm:col-span-2">
-                    <span className="mb-1.5 block text-xs font-medium text-gray-400">
-                      E-mail
-                    </span>
-                    <input
-                      type="email"
-                      value={email}
-                      onChange={(e) => setEmail(e.target.value)}
-                      autoComplete="email"
-                      className={authInputClass}
-                      placeholder="voce@email.com"
-                    />
-                  </label>
-                  <label className="block">
-                    <span className="mb-1.5 block text-xs font-medium text-gray-400">
-                      Data de nascimento
-                    </span>
-                    <input
-                      type="date"
-                      value={birthDate}
-                      onChange={(e) => setBirthDate(e.target.value)}
-                      className={`${authInputClass} [color-scheme:dark]`}
-                    />
-                  </label>
-                  <label className="block">
-                    <span className="mb-1.5 block text-xs font-medium text-gray-400">
-                      CPF
-                    </span>
-                    <input
-                      type="text"
-                      inputMode="numeric"
-                      value={cpf}
-                      onChange={(e) => setCpf(formatCpfMask(e.target.value))}
-                      className={authInputClass}
-                      placeholder="000.000.000-00"
-                    />
-                  </label>
-                </div>
-
-                {stepError && (
-                  <p className="text-xs text-rose-400">{stepError}</p>
-                )}
-
-                <button
-                  type="button"
-                  onClick={goNextFromStep1}
-                  className="w-full rounded-full bg-cyan-400 py-3 text-sm font-bold text-[#080B12] transition-colors hover:bg-cyan-300"
-                >
-                  Próximo: Estilo Musical →
-                </button>
-              </div>
-            )}
-
-            {step === 2 && (
-              <div className="space-y-4">
-                <div>
-                  <p className="text-base font-semibold text-white">
-                    Quais sons definem você?
-                  </p>
-                  <p className="mt-1 text-sm text-gray-400">
-                    Escolha pelo menos 2 gêneros.
-                  </p>
-                </div>
-
-                <div className="flex flex-wrap gap-2">
-                  {SIGNUP_GENRES.map((genre) => {
-                    const selected = favoriteGenres.includes(genre)
-                    return (
-                      <button
-                        key={genre}
-                        type="button"
-                        onClick={() => toggleGenre(genre)}
-                        className={`rounded-full border px-3.5 py-2 text-xs font-medium transition-all ${
-                          selected
-                            ? 'border-cyan-400 bg-cyan-400/15 text-cyan-300 shadow-[0_0_15px_rgba(34,211,238,0.2)]'
-                            : 'border-white/10 bg-white/5 text-gray-300 hover:border-white/25 hover:text-white'
-                        }`}
-                      >
-                        {genre}
-                      </button>
-                    )
-                  })}
-                </div>
-
-                {stepError && (
-                  <p className="text-xs text-rose-400">{stepError}</p>
-                )}
-
-                <div className="flex flex-col gap-2 sm:flex-row">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setStepError('')
-                      setStep(1)
-                    }}
-                    className="rounded-full border border-white/15 px-4 py-3 text-sm font-medium text-gray-300 transition-colors hover:border-white/30 hover:text-white sm:w-auto"
-                  >
-                    ← Voltar
-                  </button>
-                  <button
-                    type="button"
-                    onClick={goNextFromStep2}
-                    className="flex-1 rounded-full bg-cyan-400 py-3 text-sm font-bold text-[#080B12] transition-colors hover:bg-cyan-300"
-                  >
-                    Próximo: Objetivo →
-                  </button>
-                </div>
-              </div>
-            )}
-
-            {step === 3 && (
-              <div className="space-y-4">
-                <div>
-                  <p className="text-base font-semibold text-white">
-                    Como você quer usar o Azuri?
-                  </p>
-                  <p className="mt-1 text-sm text-gray-400">
-                    O que você procura no Azuri Music?
-                  </p>
-                </div>
-
-                <div className="grid grid-cols-1 gap-3">
-                  {ACCOUNT_INTENT_OPTIONS.map((option) => {
-                    const Icon = option.icon
-                    const selected = accountIntent === option.id
-                    return (
-                      <button
-                        key={option.id}
-                        type="button"
-                        onClick={() => setAccountIntent(option.id)}
-                        className={`flex items-start gap-3 rounded-xl border p-4 text-left transition-all ${
-                          selected
-                            ? 'border-cyan-400 bg-cyan-400/10 shadow-[0_0_20px_rgba(34,211,238,0.15)]'
-                            : 'border-white/10 bg-white/[0.03] hover:border-white/25'
-                        }`}
-                      >
-                        <span
-                          className={`mt-0.5 flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border ${
-                            selected
-                              ? 'border-cyan-400/50 bg-cyan-400/15 text-cyan-300'
-                              : 'border-white/10 bg-white/5 text-gray-400'
-                          }`}
-                        >
-                          <Icon className="h-5 w-5" strokeWidth={ICON_STROKE} />
-                        </span>
-                        <span className="min-w-0">
-                          <span className="block text-sm font-semibold text-white">
-                            {option.title}
-                          </span>
-                          <span className="mt-1 block text-xs leading-relaxed text-gray-400">
-                            {option.description}
-                          </span>
-                        </span>
-                      </button>
-                    )
-                  })}
-                </div>
-
-                {stepError && (
-                  <p className="text-xs text-rose-400">{stepError}</p>
-                )}
-
-                <div className="flex flex-col gap-2 sm:flex-row">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setStepError('')
-                      setStep(2)
-                    }}
-                    className="rounded-full border border-white/15 px-4 py-3 text-sm font-medium text-gray-300 transition-colors hover:border-white/30 hover:text-white sm:w-auto"
-                  >
-                    ← Voltar
-                  </button>
-                  <button
-                    type="button"
-                    onClick={goNextFromStep3}
-                    className="flex-1 rounded-full bg-cyan-400 py-3 text-sm font-bold text-[#080B12] transition-colors hover:bg-cyan-300"
-                  >
-                    Próximo: Finalizar →
-                  </button>
-                </div>
-              </div>
-            )}
-
-            {step === 4 && (
-              <div className="space-y-4">
-                <p className="text-base font-semibold text-white">
-                  Finalização e Termos
-                </p>
-
-                <div className="rounded-2xl border border-white/10 bg-white/[0.04] p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.06)] backdrop-blur-md">
-                  <p className="mb-3 text-[10px] font-semibold uppercase tracking-[0.16em] text-cyan-400">
-                    Resumo da Conta
-                  </p>
-                  <dl className="space-y-2.5 text-sm">
-                    <div className="flex justify-between gap-3">
-                      <dt className="text-gray-500">Nome completo</dt>
-                      <dd className="text-right font-medium text-white">
-                        {`${firstName.trim()} ${lastName.trim()}`.trim() || '—'}
-                      </dd>
-                    </div>
-                    <div className="flex justify-between gap-3">
-                      <dt className="text-gray-500">Usuário</dt>
-                      <dd className="text-right font-medium text-cyan-300">
-                        {handle || '—'}
-                      </dd>
-                    </div>
-                    <div className="flex justify-between gap-3">
-                      <dt className="text-gray-500">E-mail</dt>
-                      <dd className="truncate text-right font-medium text-white">
-                        {email || '—'}
-                      </dd>
-                    </div>
-                    <div className="flex justify-between gap-3">
-                      <dt className="text-gray-500">CPF</dt>
-                      <dd className="text-right font-medium text-white">
-                        {maskCpf(cpf)}
-                      </dd>
-                    </div>
-                    <div className="flex justify-between gap-3">
-                      <dt className="text-gray-500">Objetivo</dt>
-                      <dd className="text-right text-xs font-semibold uppercase tracking-wide text-cyan-300">
-                        {accountIntent
-                          ? getAccountIntentLabel(accountIntent)
-                          : '—'}
-                      </dd>
-                    </div>
-                  </dl>
-
-                  {favoriteGenres.length > 0 && (
-                    <div className="mt-4 flex flex-wrap gap-1.5 border-t border-white/10 pt-3">
-                      {favoriteGenres.map((genre) => (
-                        <span
-                          key={genre}
-                          className="rounded-full border border-cyan-400/40 bg-cyan-400/10 px-2.5 py-1 text-[10px] font-medium text-cyan-300"
-                        >
-                          {genre}
-                        </span>
-                      ))}
-                    </div>
-                  )}
-                </div>
-
-                <label className="flex cursor-pointer items-start gap-3 rounded-xl border border-white/10 bg-white/[0.03] p-3.5">
-                  <span className="relative mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center">
-                    <input
-                      type="checkbox"
-                      checked={acceptedTerms}
-                      onChange={(e) => setAcceptedTerms(e.target.checked)}
-                      className="peer sr-only"
-                    />
-                    <span className="flex h-5 w-5 items-center justify-center rounded-md border border-white/20 bg-white/5 transition-colors peer-checked:border-cyan-400 peer-checked:bg-cyan-400 peer-focus-visible:ring-2 peer-focus-visible:ring-cyan-400/50">
-                      {acceptedTerms && (
-                        <Check
-                          className="h-3.5 w-3.5 text-[#080B12]"
-                          strokeWidth={3}
-                        />
-                      )}
-                    </span>
-                  </span>
-                  <span className="text-xs leading-relaxed text-gray-400">
-                    Li e concordo com os{' '}
-                    <button
-                      type="button"
-                      onClick={(e) => {
-                        e.preventDefault()
-                        onOpenInfo('termos')
-                      }}
-                      className="font-medium text-cyan-400 underline-offset-2 hover:underline"
-                    >
-                      Termos e Condições de Uso
-                    </button>{' '}
-                    e com a{' '}
-                    <button
-                      type="button"
-                      onClick={(e) => {
-                        e.preventDefault()
-                        onOpenInfo('privacidade')
-                      }}
-                      className="font-medium text-cyan-400 underline-offset-2 hover:underline"
-                    >
-                      Política de Privacidade
-                    </button>{' '}
-                    do Azuri Music.
-                  </span>
-                </label>
-
-                <div className="flex flex-col gap-2 sm:flex-row">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setStepError('')
-                      setStep(3)
-                    }}
-                    className="rounded-full border border-white/15 px-4 py-3.5 text-sm font-medium text-gray-300 transition-colors hover:border-white/30 hover:text-white sm:w-auto"
-                  >
-                    ← Voltar
-                  </button>
-                  <button
-                    type="submit"
-                    disabled={!acceptedTerms}
-                    className="w-full flex-1 rounded-full bg-cyan-400 py-3.5 text-sm font-bold text-[#080B12] transition-colors hover:bg-cyan-300 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-cyan-400"
-                  >
-                    Finalizar cadastro e entrar
-                  </button>
-                </div>
-              </div>
-            )}
-
-            <button
-              type="button"
-              onClick={() =>
-                completeDemoLogin({
-                  name: MOCK_AUTH_PROFILE.name,
-                  email: MOCK_AUTH_PROFILE.email,
-                })
-              }
-              className="w-full pt-1 text-center text-xs text-gray-500 transition-colors hover:text-cyan-400"
-            >
-              Entrar como Visitante (Modo Demo)
-            </button>
-          </form>
-        )}
       </div>
     </div>
   )

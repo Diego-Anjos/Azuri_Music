@@ -240,7 +240,7 @@ export function Artist() {
   }
 
   return (
-    <div className="min-h-0 flex-1 overflow-y-auto bg-[#0B0F19] pb-32">
+    <div className="w-full bg-[#0B0F19]">
       {artist.isFallback && (
         <div
           role="status"
@@ -325,7 +325,7 @@ export function Artist() {
       </div>
 
       {/* 2. GRID PRINCIPAL DE CONTEÚDO */}
-      <div className="mx-auto max-w-[1600px] px-4 py-6 md:px-8 md:py-8">
+      <div className="mx-auto max-w-[1600px] px-3 py-6 sm:px-6 md:px-8 md:py-8">
         <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
           <div className="lg:col-span-2">
             {/* 1. FAIXAS EM DESTAQUE */}
@@ -352,7 +352,7 @@ export function Artist() {
             </div>
 
             {loadedCount > 0 ? (
-              <>
+              <div className="pb-12">
                 <div className="flex flex-col gap-2">
                   {visibleTracks.map((track, index) => (
                     <TrackRow
@@ -452,7 +452,7 @@ export function Artist() {
                     </button>
                   </div>
                 )}
-              </>
+              </div>
             ) : (
               <p className="text-gray-400">
                 {isLoadingTracks

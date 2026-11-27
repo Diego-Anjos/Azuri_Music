@@ -466,8 +466,8 @@ export function Search() {
     results.playlists.length > 0
 
   return (
-    <main className="pointer-events-auto relative z-10 flex min-h-0 flex-1 flex-col overflow-y-auto bg-gradient-to-b from-[#1E293B] to-[#0B0F19]">
-      <header className="pointer-events-auto px-4 pb-2 pt-2 md:px-8 md:pt-4">
+    <main className="pointer-events-auto relative z-10 flex min-h-0 flex-1 flex-col overflow-y-auto bg-gradient-to-b from-[#1E293B] to-[#0B0F19] pb-36 md:pb-32">
+      <header className="pointer-events-auto px-3 pb-2 pt-2 sm:px-6 md:px-8 md:pt-4">
         <h2 className="mb-4 text-3xl font-bold text-[#F8FAFC]">Pesquisar</h2>
         <label className="relative block max-w-xl">
           <span className="sr-only">Buscar músicas, artistas e playlists</span>
@@ -492,7 +492,7 @@ export function Search() {
         </label>
       </header>
 
-      <div className="space-y-8 px-4 py-6 md:px-8">
+      <div className="space-y-8 px-3 py-6 sm:px-6 md:px-8">
         {!debouncedQuery && (
           <p className="text-sm text-[#94A3B8]">
             Digite um artista, música ou playlist para começar.
@@ -583,29 +583,31 @@ function TracksSection({
                 className="flex shrink-0 items-center gap-3 text-left"
                 aria-label={`Reproduzir ${track.name}`}
               >
-                <span className="w-6 text-center text-sm text-[#94A3B8] group-hover:hidden">
-                  {index + 1}
-                </span>
-                <span className="hidden w-6 items-center justify-center text-[#F8FAFC] group-hover:flex">
-                  <Play
-                    className="size-4 translate-x-px"
-                    strokeWidth={ICON_STROKE}
-                    fill="currentColor"
-                  />
+                <span className="relative flex w-8 shrink-0 items-center justify-center sm:w-9">
+                  <span className="text-center text-sm text-[#94A3B8] group-hover:hidden">
+                    {index + 1}
+                  </span>
+                  <span className="absolute hidden items-center justify-center text-[#F8FAFC] group-hover:flex">
+                    <Play
+                      className="size-4 translate-x-px"
+                      strokeWidth={ICON_STROKE}
+                      fill="currentColor"
+                    />
+                  </span>
                 </span>
 
                 {track.albumCoverUrl ? (
                   <img
                     src={track.albumCoverUrl}
                     alt={track.name}
-                    className="size-10 rounded object-cover"
+                    className="size-10 shrink-0 rounded object-cover"
                   />
                 ) : (
-                  <div className="size-10 rounded bg-[#111827]" />
+                  <div className="size-10 shrink-0 rounded bg-[#111827]" />
                 )}
               </button>
 
-              <div className="min-w-0 flex-1">
+              <div className="min-w-0 flex-1 truncate">
                 <button
                   type="button"
                   onClick={() => void onPlay(toPlayerTrack(track))}
@@ -639,6 +641,13 @@ function TracksSection({
                   ))}
                 </p>
               </div>
+
+              <span className="shrink-0 tabular-nums font-mono text-xs text-[#94A3B8]">
+                {Math.floor((track.durationMs ?? 0) / 60000)}:
+                {String(
+                  Math.floor(((track.durationMs ?? 0) % 60000) / 1000),
+                ).padStart(2, '0')}
+              </span>
             </div>
           </li>
         ))}

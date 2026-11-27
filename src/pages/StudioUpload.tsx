@@ -36,6 +36,7 @@ type DraftTrack = {
   audioUrl: string
   durationMs: number
   lyrics: string
+  videoUrl: string
   audioFileName: string
   lyricsOpen: boolean
   pendingFile: File | null
@@ -49,12 +50,13 @@ const FORMAT_OPTIONS: { id: ReleaseType; label: string; hint: string }[] = [
 
 function createDraftTrack(index = 0): DraftTrack {
   return {
-    key: `draft-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+    key: `draft-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}-${index}`,
     title: '',
     featArtists: '',
     audioUrl: '',
     durationMs: 0,
     lyrics: '',
+    videoUrl: '',
     audioFileName: '',
     lyricsOpen: false,
     pendingFile: null,
@@ -211,6 +213,7 @@ export function StudioUpload() {
         audioUrl,
         durationMs: draft.durationMs,
         lyrics: draft.lyrics.trim(),
+        videoUrl: draft.videoUrl.trim() || undefined,
         plays: 0,
       })
 
@@ -681,6 +684,13 @@ function TrackEditor({
             placeholder="https://.../track.mp3"
           />
         </div>
+
+        <Field
+          label="Link do Videoclipe (YouTube) — opcional"
+          value={track.videoUrl}
+          onChange={(value) => onChange({ videoUrl: value })}
+          placeholder="https://www.youtube.com/watch?v=..."
+        />
 
         <button
           type="button"

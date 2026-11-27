@@ -12,8 +12,10 @@ export const USER_PROFILE_KEY = 'azuri_user_profile'
 export const PROFILE_UPDATED_EVENT = 'azuri-profile-updated'
 
 export type AccountIntent = 'listener' | 'creator' | 'curator' | 'both'
+export type AccountType = 'listener' | 'artist'
 
 export type UserProfile = {
+  userId: string
   name: string
   firstName: string
   lastName: string
@@ -29,6 +31,7 @@ export type UserProfile = {
   cpf: string
   favoriteGenres: string[]
   accountIntent: AccountIntent
+  accountType: AccountType
   acceptedTerms: boolean
   createdAt: string
   isAuthenticated: boolean
@@ -57,6 +60,7 @@ export type UserProfileUpdate = Partial<
     | 'bannerUrl'
     | 'favoriteGenres'
     | 'accountIntent'
+    | 'accountType'
   >
 >
 
@@ -73,11 +77,11 @@ export type RegisterUserInput = {
 }
 
 export const MOCK_AUTH_PROFILE = {
-  name: 'Diego Anjos',
-  firstName: 'Diego',
-  lastName: 'Anjos',
-  handle: '@diegoanjos',
-  email: 'diego@azurimusic.com',
+  name: '',
+  firstName: '',
+  lastName: '',
+  handle: '',
+  email: '',
 } as const
 
 const ACCOUNT_INTENT_VALUES: AccountIntent[] = [
@@ -88,24 +92,37 @@ const ACCOUNT_INTENT_VALUES: AccountIntent[] = [
 ]
 
 const DEFAULT_PROFILE: UserProfile = {
-  name: MOCK_AUTH_PROFILE.name,
-  firstName: MOCK_AUTH_PROFILE.firstName,
-  lastName: MOCK_AUTH_PROFILE.lastName,
-  handle: MOCK_AUTH_PROFILE.handle,
-  bio: 'Explorando sonoridades underground, synthwave e beats noturnos.',
-  location: 'São Paulo, Brasil',
-  avatarUrl: 'https://picsum.photos/seed/azuri-diego/256/256',
+  userId: '',
+  name: '',
+  firstName: '',
+  lastName: '',
+  handle: '',
+  bio: '',
+  location: '',
+  avatarUrl: 'https://picsum.photos/seed/azuri-guest/256/256',
   bannerUrl: 'https://picsum.photos/seed/azuri-banner-cyan/1600/500',
-  followersCount: 142,
+  followersCount: 0,
   plan: 'Azuri Plus',
-  email: MOCK_AUTH_PROFILE.email,
+  email: '',
   birthDate: '',
   cpf: '',
   favoriteGenres: [],
   accountIntent: 'listener',
+  accountType: 'listener',
   acceptedTerms: false,
   createdAt: '',
   isAuthenticated: false,
+}
+
+const GUEST_AVATAR = DEFAULT_PROFILE.avatarUrl
+const GUEST_BANNER = DEFAULT_PROFILE.bannerUrl
+
+export function accountIntentToType(intent: AccountIntent): AccountType {
+  return intent === 'creator' || intent === 'both' ? 'artist' : 'listener'
+}
+
+export function accountTypeToIntent(type: AccountType | string): AccountIntent {
+  return type === 'artist' ? 'creator' : 'listener'
 }
 
 export function getAccountIntentLabel(intent: AccountIntent): string {
@@ -171,7 +188,6 @@ function isValidProfile(value: unknown): value is Partial<UserProfile> {
     typeof item.bio === 'string' &&
     typeof item.location === 'string' &&
     typeof item.avatarUrl === 'string' &&
-    typeof item.bannerUrl === 'string' &&
     typeof item.followersCount === 'number' &&
     item.plan === 'Azuri Plus'
   )
@@ -190,9 +206,17 @@ function normalizeProfile(parsed: Partial<UserProfile>): UserProfile {
     composeName(firstName, lastName) ||
     (typeof parsed.name === 'string' ? parsed.name : DEFAULT_PROFILE.name)
 
+  const accountType =
+    parsed.accountType === 'artist' || parsed.accountType === 'listener'
+      ? parsed.accountType
+      : isAccountIntent(parsed.accountIntent)
+        ? accountIntentToType(parsed.accountIntent)
+        : DEFAULT_PROFILE.accountType
+
   return {
     ...DEFAULT_PROFILE,
     ...parsed,
+    userId: typeof parsed.userId === 'string' ? parsed.userId : DEFAULT_PROFILE.userId,
     firstName,
     lastName,
     name,
@@ -203,12 +227,21 @@ function normalizeProfile(parsed: Partial<UserProfile>): UserProfile {
         ? parsed.birthDate
         : DEFAULT_PROFILE.birthDate,
     cpf: typeof parsed.cpf === 'string' ? parsed.cpf : DEFAULT_PROFILE.cpf,
+    avatarUrl:
+      typeof parsed.avatarUrl === 'string' && parsed.avatarUrl.trim()
+        ? parsed.avatarUrl.trim()
+        : DEFAULT_PROFILE.avatarUrl,
+    bannerUrl:
+      typeof parsed.bannerUrl === 'string' && parsed.bannerUrl.trim()
+        ? parsed.bannerUrl.trim()
+        : DEFAULT_PROFILE.bannerUrl,
     favoriteGenres: Array.isArray(parsed.favoriteGenres)
       ? parsed.favoriteGenres.filter((g): g is string => typeof g === 'string')
       : DEFAULT_PROFILE.favoriteGenres,
     accountIntent: isAccountIntent(parsed.accountIntent)
       ? parsed.accountIntent
-      : DEFAULT_PROFILE.accountIntent,
+      : accountTypeToIntent(accountType),
+    accountType,
     acceptedTerms:
       typeof parsed.acceptedTerms === 'boolean'
         ? parsed.acceptedTerms
@@ -223,6 +256,63 @@ function normalizeProfile(parsed: Partial<UserProfile>): UserProfile {
         : DEFAULT_PROFILE.isAuthenticated,
     plan: 'Azuri Plus',
   }
+}
+
+/** Hidrata o cache local a partir de uma linha remota de profiles. */
+export function applyRemoteProfile(input: {
+  userId: string
+  firstName: string
+  lastName: string
+  username: string
+  email: string
+  birthDate?: string
+  cpf?: string
+  favoriteGenres?: string[]
+  accountType?: AccountType | string
+  bio?: string
+  location?: string
+  avatarUrl?: string
+  bannerUrl?: string
+  acceptedTerms?: boolean
+  createdAt?: string
+}): UserProfile {
+  const accountType: AccountType =
+    input.accountType === 'artist' ? 'artist' : 'listener'
+  const firstName = input.firstName.trim()
+  const lastName = input.lastName.trim()
+  const next: UserProfile = {
+    ...DEFAULT_PROFILE,
+    userId: input.userId,
+    firstName,
+    lastName,
+    name: composeName(firstName, lastName) || input.email,
+    handle: normalizeHandle(input.username),
+    email: input.email.trim().toLowerCase(),
+    birthDate: input.birthDate ?? '',
+    cpf: (input.cpf ?? '').replace(/\D/g, ''),
+    favoriteGenres: input.favoriteGenres ?? [],
+    accountType,
+    accountIntent: accountTypeToIntent(accountType),
+    bio: input.bio?.trim() ?? '',
+    location: input.location?.trim() ?? '',
+    avatarUrl: input.avatarUrl?.trim() || GUEST_AVATAR,
+    bannerUrl: input.bannerUrl?.trim() || GUEST_BANNER,
+    acceptedTerms: input.acceptedTerms ?? true,
+    createdAt: input.createdAt || new Date().toISOString(),
+    isAuthenticated: true,
+    plan: 'Azuri Plus',
+  }
+  writeProfile(next)
+  return { ...next }
+}
+
+export function clearAuthenticatedSession(): UserProfile {
+  const next: UserProfile = {
+    ...DEFAULT_PROFILE,
+    isAuthenticated: false,
+  }
+  writeProfile(next)
+  return { ...next }
 }
 
 function readProfileRaw(): UserProfile | null {
@@ -297,6 +387,12 @@ export function updateUserProfile(patch: UserProfileUpdate): UserProfile {
       patch.accountIntent !== undefined
         ? patch.accountIntent
         : current.accountIntent,
+    accountType:
+      patch.accountType !== undefined
+        ? patch.accountType
+        : patch.accountIntent !== undefined
+          ? accountIntentToType(patch.accountIntent)
+          : current.accountType,
     plan: 'Azuri Plus',
   }
 
@@ -310,7 +406,7 @@ export function isUserAuthenticated(): boolean {
   return stored.isAuthenticated === true
 }
 
-/** Login mock sem fricção: campos vazios caem no perfil Diego Anjos. */
+/** Login mock legado — campos vazios não preenchem nome pessoal. */
 export function authenticateUser(input?: {
   name?: string
   firstName?: string
@@ -347,8 +443,10 @@ export function authenticateUser(input?: {
     ? `@${email.split('@')[0]}`
     : current.handle || MOCK_AUTH_PROFILE.handle
 
+  const accountIntent = input?.accountIntent ?? current.accountIntent
   const next: UserProfile = {
     ...current,
+    userId: current.userId || '',
     firstName,
     lastName,
     name,
@@ -366,10 +464,8 @@ export function authenticateUser(input?: {
       input?.favoriteGenres !== undefined
         ? input.favoriteGenres
         : current.favoriteGenres,
-    accountIntent:
-      input?.accountIntent !== undefined
-        ? input.accountIntent
-        : current.accountIntent,
+    accountIntent,
+    accountType: accountIntentToType(accountIntent),
     acceptedTerms:
       input?.acceptedTerms !== undefined
         ? input.acceptedTerms
@@ -383,7 +479,7 @@ export function authenticateUser(input?: {
   return { ...next }
 }
 
-/** Cadastro completo: persiste identidade, preferências e termos no localStorage. */
+/** @deprecated Prefer AuthContext.register — mantido para compatibilidade. */
 export function registerUser(input: RegisterUserInput): UserProfile {
   const current = readProfileRaw() ?? { ...DEFAULT_PROFILE }
   const firstName = input.firstName.trim()
@@ -403,6 +499,7 @@ export function registerUser(input: RegisterUserInput): UserProfile {
     cpf: cpfDigits,
     favoriteGenres: [...input.favoriteGenres],
     accountIntent: input.accountIntent,
+    accountType: accountIntentToType(input.accountIntent),
     acceptedTerms: input.acceptedTerms,
     createdAt: new Date().toISOString(),
     isAuthenticated: true,
@@ -422,13 +519,7 @@ export function loginMock(input?: {
 }
 
 export function signOutUser(): UserProfile {
-  const current = ensureProfile()
-  const next: UserProfile = {
-    ...current,
-    isAuthenticated: false,
-  }
-  writeProfile(next)
-  return { ...next }
+  return clearAuthenticatedSession()
 }
 
 export function getProfileStats(): UserProfileStats {

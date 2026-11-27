@@ -1,15 +1,12 @@
-# Environment / secrets (Spotify, Gemini, etc.) — nunca commitar chaves
+# Environment / secrets — nunca commitar chaves
 .env
-*.env
-server/.env
 .env.local
-.env.development
-.env.production
-.env.*.local
-.env.*
+.env.development.local
+.env.test.local
+.env.production.local
+*.local
 !.env.example
 !server/.env.example
-*.local
 
 # Dependencies
 node_modules/
@@ -17,32 +14,25 @@ node_modules/
 # Build / distribution / caches
 dist/
 dist-ssr/
-server/dist/
-build/
-.output/
 .vite/
-server/cache/
-.turbo
-.next
 *.tsbuildinfo
 
-# Logs
-logs/
-*.log
+# Logs / lint cache
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
-lerna-debug.log*
+.eslintcache
 
-# IDE / OS / editor
+# OS / editors
 .DS_Store
 Thumbs.db
-.vscode/
-.cursor/
-.idea
-*.suo
-*.ntvs*
-*.njsproj
-*.sln
-*.sw?
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# Uploads / temporários locais de teste
+uploads/
+!uploads/.gitkeep
+tmp/
+!tmp/.gitkeep

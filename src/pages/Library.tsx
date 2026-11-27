@@ -49,8 +49,8 @@ export function Library() {
   }, [])
 
   return (
-    <div className="min-h-0 flex-1 overflow-y-auto bg-gradient-to-b from-[#1E293B] to-[#0B0F19] pb-32">
-      <header className="px-4 pb-2 pt-2 md:px-8 md:pt-4">
+    <div className="min-h-0 flex-1 overflow-y-auto bg-gradient-to-b from-[#1E293B] to-[#0B0F19] pb-36 md:pb-32">
+      <header className="px-3 pb-2 pt-2 sm:px-6 md:px-8 md:pt-4">
         <div className="flex items-center justify-between gap-4">
           <div className="min-w-0">
             <h1 className="text-3xl font-bold text-[#F8FAFC]">Sua Biblioteca</h1>
@@ -69,7 +69,7 @@ export function Library() {
         </div>
       </header>
 
-      <div className="space-y-10 px-4 py-6 md:px-8">
+      <div className="space-y-10 px-3 py-6 sm:px-6 md:px-8">
         <section>
           <div className="mb-4 flex items-center gap-2">
             <ListMusic className="h-5 w-5 text-cyan-400" strokeWidth={ICON_STROKE} />
@@ -133,26 +133,28 @@ export function Library() {
                       onClick={() => void playTrack(track, likedTracks)}
                       className="group flex w-full items-center gap-3 rounded-lg px-2 py-2 text-left transition-colors hover:bg-white/5"
                     >
-                      <span className="w-6 text-center text-sm text-[#94A3B8] group-hover:hidden">
-                        {index + 1}
-                      </span>
-                      <span className="hidden w-6 items-center justify-center text-cyan-400 group-hover:flex">
-                        <Play
-                          className="h-4 w-4 translate-x-px"
-                          strokeWidth={ICON_STROKE}
-                          fill="currentColor"
-                        />
+                      <span className="relative flex w-8 shrink-0 items-center justify-center sm:w-9">
+                        <span className="text-center text-sm text-[#94A3B8] group-hover:hidden">
+                          {index + 1}
+                        </span>
+                        <span className="absolute hidden items-center justify-center text-cyan-400 group-hover:flex">
+                          <Play
+                            className="h-4 w-4 translate-x-px"
+                            strokeWidth={ICON_STROKE}
+                            fill="currentColor"
+                          />
+                        </span>
                       </span>
                       {cover ? (
                         <img
                           src={cover}
                           alt=""
-                          className="h-10 w-10 rounded-md object-cover"
+                          className="h-10 w-10 shrink-0 rounded-md object-cover"
                         />
                       ) : (
-                        <div className="h-10 w-10 rounded-md bg-[#111827]" />
+                        <div className="h-10 w-10 shrink-0 rounded-md bg-[#111827]" />
                       )}
-                      <div className="min-w-0 flex-1">
+                      <div className="min-w-0 flex-1 truncate">
                         <p className="truncate text-sm font-medium text-white">
                           {track.name}
                         </p>
@@ -160,6 +162,12 @@ export function Library() {
                           {artistLabel}
                         </p>
                       </div>
+                      <span className="shrink-0 tabular-nums font-mono text-xs text-[#94A3B8]">
+                        {Math.floor((track.duration_ms ?? 0) / 60000)}:
+                        {String(
+                          Math.floor(((track.duration_ms ?? 0) % 60000) / 1000),
+                        ).padStart(2, '0')}
+                      </span>
                     </button>
                   </li>
                 )

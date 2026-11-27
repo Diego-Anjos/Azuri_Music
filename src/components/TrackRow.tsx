@@ -249,7 +249,7 @@ export function TrackRow({
       onClick={onPlay}
       onKeyDown={handleRowKeyDown}
       className={`group flex cursor-pointer flex-col rounded-xl border transition-colors ${
-        isCompact ? 'gap-0 px-4 py-2.5' : 'p-4'
+        isCompact ? 'gap-0 px-3 py-2.5 sm:px-6' : 'px-3 py-3 sm:px-6 sm:py-4'
       } ${
         isCurrent
           ? 'border-cyan-500/20 bg-[#111827]'
@@ -258,13 +258,9 @@ export function TrackRow({
     >
       {/* LINHA SUPERIOR */}
       <div
-        className={`flex ${isCompact ? 'items-center gap-3' : 'items-start gap-4'}`}
+        className={`flex ${isCompact ? 'items-center gap-3' : 'items-start gap-3 sm:gap-4'}`}
       >
-        <div
-          className={`relative flex shrink-0 items-center justify-center ${
-            isCompact ? 'h-7 w-7' : 'mt-1 w-8'
-          }`}
-        >
+        <div className="relative flex w-8 shrink-0 items-center justify-center sm:w-9">
           <span
             className={`absolute font-mono transition-opacity group-hover:opacity-0 ${
               isCompact ? 'text-sm' : ''
@@ -275,7 +271,7 @@ export function TrackRow({
           <button
             type="button"
             className={`relative z-10 flex items-center justify-center rounded-full bg-cyan-400 text-black opacity-0 transition-opacity group-hover:opacity-100 ${
-              isCompact ? 'h-7 w-7' : 'h-8 w-8'
+              isCompact ? 'h-7 w-7' : 'h-8 w-8 sm:h-9 sm:w-9'
             }`}
             onClick={(event) => {
               event.stopPropagation()
@@ -295,170 +291,170 @@ export function TrackRow({
             <img
               src={coverUrl}
               alt={track.name}
-              className="h-12 w-12 rounded-md object-cover shadow-md"
+              className="h-12 w-12 shrink-0 rounded-md object-cover shadow-md"
             />
           ) : (
-            <div className="h-12 w-12 rounded-md bg-[#0B0F19] shadow-md" />
+            <div className="h-12 w-12 shrink-0 rounded-md bg-[#0B0F19] shadow-md" />
           ))}
 
-        <div
-          className={`flex min-w-0 flex-1 ${
-            isCompact
-              ? 'items-center justify-between gap-3'
-              : 'items-start justify-between gap-3'
-          }`}
-        >
-          <div className="flex min-w-0 flex-col">
-            <span
-              className={`line-clamp-1 font-medium transition-colors group-hover:text-cyan-400 ${
-                isCompact ? 'text-sm' : 'text-base'
-              } ${isCurrent ? 'text-cyan-400' : 'text-white'}`}
-            >
-              {track.name}
-            </span>
-            <span
-              className={`truncate text-gray-400 ${isCompact ? 'text-xs' : 'text-sm'}`}
-            >
-              {artistsLabel}
-            </span>
-          </div>
-
+        <div className="flex min-w-0 flex-1 flex-col gap-0">
           <div
-            className={`flex shrink-0 items-center gap-2 ${isCompact ? '' : 'mt-1'}`}
+            className={`flex min-w-0 w-full ${
+              isCompact
+                ? 'items-center justify-between gap-3'
+                : 'items-start justify-between gap-3'
+            }`}
           >
-            <button
-              type="button"
-              className={`${actionBtnClass} ${
-                liked
-                  ? 'text-cyan-400 opacity-100'
-                  : 'opacity-100 sm:opacity-0 sm:group-hover:opacity-100'
-              }`}
-              onClick={toggleLike}
-              aria-label={liked ? 'Remover curtida' : 'Curtir faixa'}
-              aria-pressed={liked}
-            >
-              <Heart
-                className={`h-4 w-4 ${liked ? 'fill-cyan-400 text-cyan-400' : ''}`}
-                strokeWidth={ICON_STROKE}
-              />
-            </button>
+            <div className="min-w-0 flex-1 truncate">
+              <span
+                className={`block truncate font-medium transition-colors group-hover:text-cyan-400 ${
+                  isCompact ? 'text-sm' : 'text-base'
+                } ${isCurrent ? 'text-cyan-400' : 'text-white'}`}
+              >
+                {track.name}
+              </span>
+              <span
+                className={`block truncate text-gray-400 ${isCompact ? 'text-xs' : 'text-sm'}`}
+              >
+                {artistsLabel}
+              </span>
+            </div>
 
-            <button
-              type="button"
-              className={`${actionBtnClass} hidden items-center opacity-0 group-hover:opacity-100 sm:flex ${
-                commentsOpen ? 'text-cyan-400 opacity-100' : ''
-              }`}
-              onClick={toggleComments}
-              aria-label="Comentários"
-              aria-expanded={commentsOpen}
+            <div
+              className={`flex shrink-0 items-center gap-1 sm:gap-2 ${isCompact ? '' : 'mt-1'}`}
             >
-              <MessageSquare className="h-4 w-4" strokeWidth={ICON_STROKE} />
-              {comments.length > 0 && (
-                <span className="ml-1 font-mono text-xs">{comments.length}</span>
-              )}
-            </button>
-
-            <button
-              type="button"
-              className={`${actionBtnClass} hidden opacity-0 group-hover:opacity-100 sm:flex ${
-                shareOpen ? 'text-cyan-400 opacity-100' : ''
-              }`}
-              onClick={handleShare}
-              aria-label="Compartilhar"
-            >
-              <Share2 className="h-4 w-4" strokeWidth={ICON_STROKE} />
-            </button>
-
-            <div className="relative hidden sm:block" ref={menuRef}>
               <button
                 type="button"
-                className={`${actionBtnClass} opacity-0 group-hover:opacity-100 ${
-                  menuOpen ? 'text-cyan-400 opacity-100' : ''
+                className={`${actionBtnClass} ${
+                  liked
+                    ? 'text-cyan-400 opacity-100'
+                    : 'opacity-100 sm:opacity-0 sm:group-hover:opacity-100'
                 }`}
-                onClick={(event) => {
-                  event.stopPropagation()
-                  setMenuOpen((prev) => !prev)
-                }}
-                aria-label="Mais opções"
-                aria-haspopup="menu"
-                aria-expanded={menuOpen}
-                aria-controls={menuId}
+                onClick={toggleLike}
+                aria-label={liked ? 'Remover curtida' : 'Curtir faixa'}
+                aria-pressed={liked}
               >
-                <MoreHorizontal className="h-4 w-4" strokeWidth={ICON_STROKE} />
+                <Heart
+                  className={`h-4 w-4 ${liked ? 'fill-cyan-400 text-cyan-400' : ''}`}
+                  strokeWidth={ICON_STROKE}
+                />
               </button>
 
-              {menuOpen && (
-                <div
-                  id={menuId}
-                  role="menu"
-                  className="absolute right-0 top-full z-50 mt-1 w-48 rounded-xl border border-white/10 bg-[#0F172A]/95 py-1.5 shadow-2xl backdrop-blur-xl"
-                  onClick={(event) => event.stopPropagation()}
+              <button
+                type="button"
+                className={`${actionBtnClass} hidden items-center opacity-0 group-hover:opacity-100 sm:flex ${
+                  commentsOpen ? 'text-cyan-400 opacity-100' : ''
+                }`}
+                onClick={toggleComments}
+                aria-label="Comentários"
+                aria-expanded={commentsOpen}
+              >
+                <MessageSquare className="h-4 w-4" strokeWidth={ICON_STROKE} />
+                {comments.length > 0 && (
+                  <span className="ml-1 font-mono text-xs">{comments.length}</span>
+                )}
+              </button>
+
+              <button
+                type="button"
+                className={`${actionBtnClass} hidden opacity-0 group-hover:opacity-100 sm:flex ${
+                  shareOpen ? 'text-cyan-400 opacity-100' : ''
+                }`}
+                onClick={handleShare}
+                aria-label="Compartilhar"
+              >
+                <Share2 className="h-4 w-4" strokeWidth={ICON_STROKE} />
+              </button>
+
+              <div className="relative" ref={menuRef}>
+                <button
+                  type="button"
+                  className={`${actionBtnClass} opacity-100 sm:opacity-0 sm:group-hover:opacity-100 ${
+                    menuOpen ? 'text-cyan-400 !opacity-100' : ''
+                  }`}
+                  onClick={(event) => {
+                    event.stopPropagation()
+                    setMenuOpen((prev) => !prev)
+                  }}
+                  aria-label="Mais opções"
+                  aria-haspopup="menu"
+                  aria-expanded={menuOpen}
+                  aria-controls={menuId}
                 >
-                  <button
-                    type="button"
-                    role="menuitem"
-                    className="flex w-full items-center gap-2.5 px-3 py-2 text-left text-sm text-gray-300 transition-colors hover:bg-white/5 hover:text-cyan-400"
-                    onClick={handlePlayNext}
+                  <MoreHorizontal className="h-4 w-4" strokeWidth={ICON_STROKE} />
+                </button>
+
+                {menuOpen && (
+                  <div
+                    id={menuId}
+                    role="menu"
+                    className="absolute right-0 top-full z-50 mt-1 w-48 rounded-xl border border-white/10 bg-[#0F172A]/95 py-1.5 shadow-2xl backdrop-blur-xl"
+                    onClick={(event) => event.stopPropagation()}
                   >
-                    <ListPlus className="h-4 w-4 shrink-0" strokeWidth={ICON_STROKE} />
-                    Tocar a seguir
-                  </button>
-                  <button
-                    type="button"
-                    role="menuitem"
-                    className="flex w-full items-center gap-2.5 px-3 py-2 text-left text-sm text-gray-300 transition-colors hover:bg-white/5 hover:text-cyan-400"
-                    onClick={handleAddToPlaylist}
-                  >
-                    <FolderPlus className="h-4 w-4 shrink-0" strokeWidth={ICON_STROKE} />
-                    Adicionar à Playlist
-                  </button>
-                  {track.album?.id && (
                     <button
                       type="button"
                       role="menuitem"
                       className="flex w-full items-center gap-2.5 px-3 py-2 text-left text-sm text-gray-300 transition-colors hover:bg-white/5 hover:text-cyan-400"
-                      onClick={handleGoToAlbum}
+                      onClick={handlePlayNext}
                     >
-                      <Disc className="h-4 w-4 shrink-0" strokeWidth={ICON_STROKE} />
-                      Ir para o Álbum
+                      <ListPlus className="h-4 w-4 shrink-0" strokeWidth={ICON_STROKE} />
+                      Tocar a seguir
                     </button>
-                  )}
-                  <button
-                    type="button"
-                    role="menuitem"
-                    className="flex w-full items-center gap-2.5 px-3 py-2 text-left text-sm text-gray-300 transition-colors hover:bg-white/5 hover:text-cyan-400"
-                    onClick={handleTrackStation}
-                  >
-                    <Radio className="h-4 w-4 shrink-0" strokeWidth={ICON_STROKE} />
-                    Estação da Faixa
-                  </button>
-                </div>
-              )}
+                    <button
+                      type="button"
+                      role="menuitem"
+                      className="flex w-full items-center gap-2.5 px-3 py-2 text-left text-sm text-gray-300 transition-colors hover:bg-white/5 hover:text-cyan-400"
+                      onClick={handleAddToPlaylist}
+                    >
+                      <FolderPlus className="h-4 w-4 shrink-0" strokeWidth={ICON_STROKE} />
+                      Adicionar à Playlist
+                    </button>
+                    {track.album?.id && (
+                      <button
+                        type="button"
+                        role="menuitem"
+                        className="flex w-full items-center gap-2.5 px-3 py-2 text-left text-sm text-gray-300 transition-colors hover:bg-white/5 hover:text-cyan-400"
+                        onClick={handleGoToAlbum}
+                      >
+                        <Disc className="h-4 w-4 shrink-0" strokeWidth={ICON_STROKE} />
+                        Ir para o Álbum
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      role="menuitem"
+                      className="flex w-full items-center gap-2.5 px-3 py-2 text-left text-sm text-gray-300 transition-colors hover:bg-white/5 hover:text-cyan-400"
+                      onClick={handleTrackStation}
+                    >
+                      <Radio className="h-4 w-4 shrink-0" strokeWidth={ICON_STROKE} />
+                      Estação da Faixa
+                    </button>
+                  </div>
+                )}
+              </div>
+
+              <span
+                className={`shrink-0 tabular-nums font-mono text-gray-500 ${
+                  isCompact ? 'w-10 text-right text-xs' : 'text-sm'
+                }`}
+              >
+                {formatDuration(track.duration_ms ?? 0)}
+              </span>
             </div>
-
-            <span
-              className={`font-mono text-gray-500 ${
-                isCompact ? 'w-10 text-right text-xs' : 'text-sm'
-              }`}
-            >
-              {formatDuration(track.duration_ms ?? 0)}
-            </span>
           </div>
-        </div>
-      </div>
 
-      {/* WAVEFORM — oculta no mobile */}
-      <div className="hidden sm:block">
-        <TrackWaveform
-          trackId={track.id}
-          trackName={track.name}
-          durationMs={track.duration_ms ?? 0}
-          barCount={65}
-          variant={isCompact ? 'compact' : 'featured'}
-          className={
-            isCompact ? 'mt-1.5 h-4 pl-10' : 'mt-3 h-10 pl-[3.25rem]'
-          }
-        />
+          {/* WAVEFORM — alinhada ao título (esquerda) e duração (direita) */}
+          <TrackWaveform
+            trackId={track.id}
+            trackName={track.name}
+            durationMs={track.duration_ms ?? 0}
+            barCount={65}
+            variant={isCompact ? 'compact' : 'featured'}
+            className={
+              isCompact ? 'mt-1.5 h-4 w-full' : 'mt-3 h-8 w-full sm:h-10'
+            }
+          />
+        </div>
       </div>
 
       {/* GAVETA DE COMENTÁRIOS */}

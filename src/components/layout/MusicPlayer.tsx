@@ -1,8 +1,10 @@
 import {
   ChevronUp,
+  Clapperboard,
   Heart,
   Mic2,
   Pause,
+  PictureInPicture2,
   Play,
   Repeat,
   Shuffle,
@@ -24,6 +26,7 @@ import {
   PlayerProvider,
   usePlayerAudio,
 } from '../../contexts/PlayerContext'
+import { useExternalPiP } from '../../hooks/useExternalPiP'
 import {
   getAudioSettings,
   getQualityBadgeLabel,
@@ -93,12 +96,22 @@ function MusicPlayerInner({
     setDuration,
     clearSeekRequest,
     handleNextTrack,
+    playPrevious,
     isLyricsOpen,
     toggleLyrics,
     seekTo,
     fallbackToYoutube,
     refreshStreamQuality,
+    isVideoMode,
+    toggleVideoMode,
+    repeatMode,
+    toggleRepeat,
   } = usePlayerStore()
+  const {
+    isOpen: isExternalPipOpen,
+    isSupported: isExternalPipSupported,
+    toggle: toggleExternalPip,
+  } = useExternalPiP()
   const playerRef = useRef<ReactPlayer | null>(null)
   const [liked, setLiked] = useState(false)
   const [audioSettings, setAudioSettings] = useState<AudioSettings>(() =>
@@ -128,7 +141,6 @@ function MusicPlayerInner({
     { id: number; emoji: string }[]
   >([])
   const [shuffle, setShuffle] = useState(false)
-  const [repeat, setRepeat] = useState(false)
 
   const title = currentTrack?.name ?? 'Nenhuma música'
   const artists = currentTrack?.artists ?? []
@@ -154,6 +166,8 @@ function MusicPlayerInner({
 
   useEffect(() => {
     if (seekRequest == null) return
+    // No Modo Vídeo o seek é aplicado pelo VideoStageView
+    if (isVideoMode) return
 
     if (usingLocalAudio && audioRef.current) {
       const dur = audioRef.current.duration
@@ -167,13 +181,20 @@ function MusicPlayerInner({
     if (!playerRef.current) return
     playerRef.current.seekTo(seekRequest, 'fraction')
     clearSeekRequest()
-  }, [seekRequest, clearSeekRequest, usingLocalAudio])
+  }, [seekRequest, clearSeekRequest, usingLocalAudio, isVideoMode])
 
   useEffect(() => {
     const audio = audioRef.current
     if (!audio || !usingLocalAudio) return
 
     audio.volume = Math.min(1, Math.max(0, effectiveVolume))
+
+    // Modo Vídeo: silencia o <audio> nativo para não duplicar o som
+    if (isVideoMode) {
+      audio.pause()
+      return
+    }
+
     if (isPlaying) {
       void resumeAudioContext().then(() =>
         audio.play().catch(() => {
@@ -185,6 +206,7 @@ function MusicPlayerInner({
     }
   }, [
     isPlaying,
+    isVideoMode,
     effectiveVolume,
     usingLocalAudio,
     localAudioUrl,
@@ -284,7 +306,7 @@ function MusicPlayerInner({
         preload="auto"
         className="hidden"
         onTimeUpdate={(event) => {
-          if (!usingLocalAudio) return
+          if (!usingLocalAudio || isVideoMode) return
           const el = event.currentTarget
           if (!Number.isFinite(el.duration) || el.duration <= 0) return
           setProgress(el.currentTime / el.duration)
@@ -295,15 +317,15 @@ function MusicPlayerInner({
           if (Number.isFinite(el.duration)) setDuration(el.duration)
         }}
         onEnded={() => {
-          if (!usingLocalAudio) return
+          if (!usingLocalAudio || isVideoMode) return
           void handleNextTrack()
         }}
         onError={() => {
-          if (!usingLocalAudio) return
+          if (!usingLocalAudio || isVideoMode) return
           void handleAudioError()
         }}
       />
-      {!usingLocalAudio && youtubeVideoId ? (
+      {!usingLocalAudio && youtubeVideoId && !isVideoMode ? (
         <ReactPlayer
           ref={playerRef}
           url={`https://www.youtube.com/watch?v=${youtubeVideoId}`}
@@ -371,6 +393,22 @@ function MusicPlayerInner({
         <div className="flex shrink-0 items-center gap-1.5">
           <button
             type="button"
+            title="Modo Vídeo"
+            aria-label="Modo Vídeo"
+            aria-pressed={isVideoMode}
+            onClick={() => void toggleVideoMode()}
+            disabled={!currentTrack}
+            className={`rounded-full p-2 transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
+              isVideoMode
+                ? 'text-cyan-400 drop-shadow-[0_0_8px_rgba(34,211,238,0.7)]'
+                : 'text-[#94A3B8] hover:text-[#F8FAFC]'
+            }`}
+          >
+            <Clapperboard className="size-5" strokeWidth={ICON_STROKE} />
+          </button>
+
+          <button
+            type="button"
             title="Letras"
             aria-label="Letras"
             aria-pressed={isLyricsOpen}
@@ -384,6 +422,24 @@ function MusicPlayerInner({
           >
             <Mic2 className="size-5" strokeWidth={ICON_STROKE} />
           </button>
+
+          {isExternalPipSupported && (
+            <button
+              type="button"
+              title="Janela Flutuante (Fora do Navegador)"
+              aria-label="Janela Flutuante (Fora do Navegador)"
+              aria-pressed={isExternalPipOpen}
+              onClick={() => void toggleExternalPip()}
+              disabled={!currentTrack}
+              className={`rounded-full p-2 transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
+                isExternalPipOpen
+                  ? 'text-cyan-400 drop-shadow-[0_0_8px_rgba(34,211,238,0.7)]'
+                  : 'text-[#94A3B8] hover:text-[#F8FAFC]'
+              }`}
+            >
+              <PictureInPicture2 className="size-5" strokeWidth={ICON_STROKE} />
+            </button>
+          )}
 
           <button
             type="button"
@@ -529,7 +585,8 @@ function MusicPlayerInner({
             <button
               type="button"
               aria-label="Faixa anterior"
-              className="text-[#94A3B8] transition-colors duration-200 hover:text-[#F8FAFC]"
+              onClick={() => void playPrevious()}
+              className="cursor-pointer text-[#94A3B8] transition-transform transition-colors duration-200 hover:text-[#F8FAFC] active:scale-90"
             >
               <SkipBack className="size-5" strokeWidth={ICON_STROKE} />
             </button>
@@ -568,10 +625,10 @@ function MusicPlayerInner({
             <button
               type="button"
               aria-label="Repetir"
-              aria-pressed={repeat}
-              onClick={() => setRepeat((prev) => !prev)}
-              className={`transition-colors duration-200 ${
-                repeat
+              aria-pressed={repeatMode === 'all'}
+              onClick={toggleRepeat}
+              className={`cursor-pointer transition-colors duration-200 ${
+                repeatMode === 'all'
                   ? 'text-cyan-400'
                   : 'text-[#94A3B8] hover:text-[#F8FAFC]'
               }`}
@@ -650,6 +707,28 @@ function MusicPlayerInner({
         <div className="flex flex-1 items-center justify-end gap-3">
           <button
             type="button"
+            title="Modo Vídeo"
+            aria-label="Modo Vídeo"
+            aria-pressed={isVideoMode}
+            onClick={() => void toggleVideoMode()}
+            disabled={!currentTrack}
+            className={`relative flex flex-col items-center gap-1 transition-colors duration-200 disabled:cursor-not-allowed disabled:opacity-40 ${
+              isVideoMode
+                ? 'text-cyan-400 drop-shadow-[0_0_10px_rgba(34,211,238,0.75)]'
+                : 'text-[#94A3B8] hover:text-[#F8FAFC]'
+            }`}
+          >
+            <Clapperboard className="size-5" strokeWidth={ICON_STROKE} />
+            {isVideoMode && (
+              <span
+                className="absolute -bottom-1 h-1 w-1 rounded-full bg-cyan-400 shadow-[0_0_6px_rgba(34,211,238,0.9)]"
+                aria-hidden
+              />
+            )}
+          </button>
+
+          <button
+            type="button"
             title="Letras"
             aria-label="Letras"
             aria-pressed={isLyricsOpen}
@@ -669,6 +748,30 @@ function MusicPlayerInner({
               />
             )}
           </button>
+
+          {isExternalPipSupported && (
+            <button
+              type="button"
+              title="Janela Flutuante (Fora do Navegador)"
+              aria-label="Janela Flutuante (Fora do Navegador)"
+              aria-pressed={isExternalPipOpen}
+              onClick={() => void toggleExternalPip()}
+              disabled={!currentTrack}
+              className={`relative flex flex-col items-center gap-1 transition-colors duration-200 disabled:cursor-not-allowed disabled:opacity-40 ${
+                isExternalPipOpen
+                  ? 'text-cyan-400 drop-shadow-[0_0_10px_rgba(34,211,238,0.75)]'
+                  : 'text-[#94A3B8] hover:text-[#F8FAFC]'
+              }`}
+            >
+              <PictureInPicture2 className="size-5" strokeWidth={ICON_STROKE} />
+              {isExternalPipOpen && (
+                <span
+                  className="absolute -bottom-1 h-1 w-1 rounded-full bg-cyan-400 shadow-[0_0_6px_rgba(34,211,238,0.9)]"
+                  aria-hidden
+                />
+              )}
+            </button>
+          )}
 
           <div className="flex items-center gap-2">
             <Volume2

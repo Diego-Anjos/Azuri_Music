@@ -16,7 +16,10 @@ import {
   type AudioSettings,
   type EqBands,
 } from '../services/audioSettingsService'
-import { usePlayerStore } from '../store/usePlayerStore'
+import {
+  usePlayerStore,
+  type VideoDisplayMode,
+} from '../store/usePlayerStore'
 import {
   beginPlayRequest,
   getPlayRequestId,
@@ -24,6 +27,7 @@ import {
   registerPlaybackAudioElement,
   resetNativeAudioElement,
 } from '../services/playbackGuard'
+import { appendListeningSeconds } from '../services/listeningStats'
 
 type FilterBank = {
   subBass: BiquadFilterNode
@@ -56,6 +60,15 @@ type PlayerContextValue = {
   preparePlayRequest: () => { requestId: number; signal: AbortSignal }
   /** true se o requestId ainda é o play ativo. */
   isPlayRequestCurrent: (requestId: number) => boolean
+  /** Modo Vídeo — estado espelhado do store + handoff Áudio↔Vídeo. */
+  isVideoMode: boolean
+  videoDisplayMode: VideoDisplayMode
+  currentVideoId: string | null
+  isLoadingVideo: boolean
+  isOfficialClip: boolean
+  toggleVideoMode: () => Promise<void>
+  setVideoMode: (enabled: boolean) => Promise<void>
+  setVideoDisplayMode: (mode: VideoDisplayMode) => void
 }
 
 const PlayerContext = createContext<PlayerContextValue | null>(null)
@@ -195,6 +208,22 @@ export function PlayerProvider({
   const playRequestIdRef = useRef(0)
   const setStoreEqActive = usePlayerStore((s) => s.setEqActive)
   const storePlayRequestId = usePlayerStore((s) => s.playRequestId)
+  const isVideoMode = usePlayerStore((s) => s.isVideoMode)
+  const videoDisplayMode = usePlayerStore((s) => s.videoDisplayMode)
+  const currentVideoId = usePlayerStore((s) => s.currentVideoId)
+  const isLoadingVideo = usePlayerStore((s) => s.isLoadingVideo)
+  const isOfficialClip = usePlayerStore((s) => s.isOfficialClip)
+  const toggleVideoMode = usePlayerStore((s) => s.toggleVideoMode)
+  const setVideoMode = usePlayerStore((s) => s.setVideoMode)
+  const setVideoDisplayMode = usePlayerStore((s) => s.setVideoDisplayMode)
+  const currentTrack = usePlayerStore((s) => s.currentTrack)
+  const isPlaying = usePlayerStore((s) => s.isPlaying)
+  const progress = usePlayerStore((s) => s.progress)
+  const duration = usePlayerStore((s) => s.duration)
+  const togglePlay = usePlayerStore((s) => s.togglePlay)
+  const seekTo = usePlayerStore((s) => s.seekTo)
+  const handleNextTrack = usePlayerStore((s) => s.handleNextTrack)
+  const playPrevious = usePlayerStore((s) => s.playPrevious)
 
   useEffect(() => {
     playRequestIdRef.current = storePlayRequestId || getPlayRequestId()
@@ -223,6 +252,159 @@ export function PlayerProvider({
       // ignore autoplay / resume failures
     }
   }, [])
+
+  // Media Session — controles do SO / teclas multimídia com o browser minimizado
+  useEffect(() => {
+    if (!('mediaSession' in navigator)) return
+
+    if (!currentTrack) {
+      navigator.mediaSession.metadata = null
+      return
+    }
+
+    const artworkUrl = currentTrack.album?.images?.[0]?.url
+    navigator.mediaSession.metadata = new MediaMetadata({
+      title: currentTrack.name,
+      artist: currentTrack.artists?.map((a) => a.name).join(', ') ?? '',
+      album: currentTrack.album?.name ?? '',
+      artwork: artworkUrl
+        ? [
+            { src: artworkUrl, sizes: '512x512', type: 'image/jpeg' },
+            { src: artworkUrl, sizes: '256x256', type: 'image/jpeg' },
+          ]
+        : [],
+    })
+
+    navigator.mediaSession.setActionHandler('play', () => {
+      void resumeAudioContext()
+      if (!usePlayerStore.getState().isPlaying) togglePlay()
+    })
+    navigator.mediaSession.setActionHandler('pause', () => {
+      if (usePlayerStore.getState().isPlaying) togglePlay()
+    })
+    navigator.mediaSession.setActionHandler('previoustrack', () => {
+      void playPrevious()
+    })
+    navigator.mediaSession.setActionHandler('nexttrack', () => {
+      void handleNextTrack()
+    })
+    navigator.mediaSession.setActionHandler('seekto', (details) => {
+      const dur = usePlayerStore.getState().duration
+      if (
+        details.seekTime != null &&
+        Number.isFinite(details.seekTime) &&
+        dur > 0
+      ) {
+        seekTo(Math.min(1, Math.max(0, details.seekTime / dur)))
+      }
+    })
+
+    return () => {
+      try {
+        navigator.mediaSession.setActionHandler('play', null)
+        navigator.mediaSession.setActionHandler('pause', null)
+        navigator.mediaSession.setActionHandler('previoustrack', null)
+        navigator.mediaSession.setActionHandler('nexttrack', null)
+        navigator.mediaSession.setActionHandler('seekto', null)
+      } catch {
+        // ignore
+      }
+    }
+  }, [
+    currentTrack,
+    togglePlay,
+    handleNextTrack,
+    playPrevious,
+    seekTo,
+    resumeAudioContext,
+  ])
+
+  useEffect(() => {
+    if (!('mediaSession' in navigator)) return
+    navigator.mediaSession.playbackState = isPlaying ? 'playing' : 'paused'
+    if (duration > 0 && Number.isFinite(progress)) {
+      try {
+        navigator.mediaSession.setPositionState({
+          duration,
+          position: Math.min(duration, Math.max(0, progress * duration)),
+          playbackRate: 1,
+        })
+      } catch {
+        // setPositionState pode falhar se duration=0
+      }
+    }
+  }, [isPlaying, progress, duration])
+
+  // Meu Pulso — contabiliza segundos reais (áudio, vídeo e mini-player externo)
+  const listeningAccRef = useRef(0)
+  const listeningTrackRef = useRef(currentTrack)
+
+  useEffect(() => {
+    listeningTrackRef.current = currentTrack
+  }, [currentTrack])
+
+  useEffect(() => {
+    if (!isPlaying || !currentTrack) {
+      const pending = listeningAccRef.current
+      const track = listeningTrackRef.current
+      if (pending > 0 && track) {
+        appendListeningSeconds(track, pending)
+        listeningAccRef.current = 0
+      }
+      return
+    }
+
+    const trackId = currentTrack.id
+    const intervalId = window.setInterval(() => {
+      const track = listeningTrackRef.current
+      if (!track || track.id !== trackId) return
+      listeningAccRef.current += 1
+      if (listeningAccRef.current >= 5) {
+        appendListeningSeconds(track, listeningAccRef.current)
+        listeningAccRef.current = 0
+      }
+    }, 1000)
+
+    return () => {
+      window.clearInterval(intervalId)
+      const pending = listeningAccRef.current
+      const track = listeningTrackRef.current
+      if (pending > 0 && track) {
+        appendListeningSeconds(track, pending)
+        listeningAccRef.current = 0
+      }
+    }
+  }, [isPlaying, currentTrack?.id])
+
+  // Nunca pausar ao minimizar — só retoma o AudioContext se o browser suspender
+  useEffect(() => {
+    const keepAlive = () => {
+      if (document.visibilityState !== 'visible') {
+        void resumeAudioContext()
+        return
+      }
+      void resumeAudioContext()
+      const audio = audioRef.current
+      const state = usePlayerStore.getState()
+      if (
+        audio &&
+        state.isPlaying &&
+        !state.isVideoMode &&
+        state.localAudioUrl &&
+        audio.paused
+      ) {
+        void audio.play().catch(() => undefined)
+      }
+    }
+
+    document.addEventListener('visibilitychange', keepAlive)
+    window.addEventListener('focus', keepAlive)
+    // Intencionalmente sem listener de blur que pause a reprodução
+    return () => {
+      document.removeEventListener('visibilitychange', keepAlive)
+      window.removeEventListener('focus', keepAlive)
+    }
+  }, [audioRef, resumeAudioContext])
 
   const preparePlayRequest = useCallback(() => {
     const { requestId, signal } = beginPlayRequest()
@@ -333,6 +515,14 @@ export function PlayerProvider({
       getAudioElement,
       preparePlayRequest,
       isPlayRequestCurrent: checkPlayRequestCurrent,
+      isVideoMode,
+      videoDisplayMode,
+      currentVideoId,
+      isLoadingVideo,
+      isOfficialClip,
+      toggleVideoMode,
+      setVideoMode,
+      setVideoDisplayMode,
     }),
     [
       isEqActive,
@@ -341,6 +531,14 @@ export function PlayerProvider({
       getAudioElement,
       preparePlayRequest,
       checkPlayRequestCurrent,
+      isVideoMode,
+      videoDisplayMode,
+      currentVideoId,
+      isLoadingVideo,
+      isOfficialClip,
+      toggleVideoMode,
+      setVideoMode,
+      setVideoDisplayMode,
     ],
   )
 
@@ -351,6 +549,15 @@ export function PlayerProvider({
 
 export function usePlayerAudio(): PlayerContextValue {
   const ctx = useContext(PlayerContext)
+  const isVideoMode = usePlayerStore((s) => s.isVideoMode)
+  const videoDisplayMode = usePlayerStore((s) => s.videoDisplayMode)
+  const currentVideoId = usePlayerStore((s) => s.currentVideoId)
+  const isLoadingVideo = usePlayerStore((s) => s.isLoadingVideo)
+  const isOfficialClip = usePlayerStore((s) => s.isOfficialClip)
+  const toggleVideoMode = usePlayerStore((s) => s.toggleVideoMode)
+  const setVideoMode = usePlayerStore((s) => s.setVideoMode)
+  const setVideoDisplayMode = usePlayerStore((s) => s.setVideoDisplayMode)
+
   if (!ctx) {
     return {
       isEqActive: false,
@@ -359,6 +566,14 @@ export function usePlayerAudio(): PlayerContextValue {
       getAudioElement: () => sharedAudioElement,
       preparePlayRequest: () => beginPlayRequest(),
       isPlayRequestCurrent,
+      isVideoMode,
+      videoDisplayMode,
+      currentVideoId,
+      isLoadingVideo,
+      isOfficialClip,
+      toggleVideoMode,
+      setVideoMode,
+      setVideoDisplayMode,
     }
   }
   return ctx

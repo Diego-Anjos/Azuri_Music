@@ -121,7 +121,7 @@ export function TrackWaveform({
   return (
     <div
       ref={containerRef}
-      className={`flex h-full w-full items-end justify-between gap-[2px] overflow-hidden ${
+      className={`flex h-full w-full items-end justify-between gap-[3px] overflow-hidden ${
         canSeek ? 'cursor-pointer' : ''
       } ${className}`}
       role={isCurrent && interactiveSeek ? 'slider' : undefined}
@@ -190,11 +190,19 @@ export function TrackWaveform({
                 ? 1
                 : 0.4
 
+        // Oculta barras excedentes em viewports estreitos para evitar overflow
+        const responsiveVisibility =
+          index >= 48
+            ? 'hidden md:block'
+            : index >= 32
+              ? 'hidden sm:block'
+              : ''
+
         return (
           <div
             key={index}
             aria-hidden
-            className={`min-w-[2px] flex-1 rounded-full ${colorClass} ${barClassName}`}
+            className={`min-w-[2px] flex-1 rounded-full ${colorClass} ${responsiveVisibility} ${barClassName}`}
             style={{ ...heightStyle, opacity }}
           />
         )

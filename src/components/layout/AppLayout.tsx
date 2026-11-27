@@ -47,14 +47,27 @@ function MobileBottomNav() {
 
 export function AppLayout() {
   const isLyricsOpen = usePlayerStore((s) => s.isLyricsOpen)
+  const isVideoMode = usePlayerStore((s) => s.isVideoMode)
+  const videoDisplayMode = usePlayerStore((s) => s.videoDisplayMode)
+  const hideTopNav =
+    isLyricsOpen ||
+    (isVideoMode &&
+      (videoDisplayMode === 'stage' || videoDisplayMode === 'split-lyrics'))
 
   return (
     <div className="relative flex h-screen flex-col overflow-hidden bg-[#0B0F19]">
       <div className="flex min-h-0 flex-1">
         <Sidebar />
-        <main className="relative flex h-full min-h-0 min-w-0 flex-1 flex-col overflow-y-auto pb-36 md:pb-28">
-          {!isLyricsOpen && <TopNavControls />}
-          <Outlet />
+        <main className="relative flex h-full min-h-0 min-w-0 flex-1 flex-col overflow-y-auto">
+          {!hideTopNav && <TopNavControls />}
+          <div className="min-w-0 flex-1 pb-36 md:pb-32">
+            <Outlet />
+          </div>
+          {/* Espaçador físico: garante scroll acima do player fixo */}
+          <div
+            className="h-32 w-full shrink-0 md:h-28"
+            aria-hidden="true"
+          />
         </main>
       </div>
       <MusicPlayer />

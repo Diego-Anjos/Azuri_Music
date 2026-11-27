@@ -1,4 +1,5 @@
 import {
+  Activity,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
@@ -11,9 +12,9 @@ import {
 } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
+import { useAuth } from '../contexts/AuthContext'
 import {
   getUserProfile,
-  signOutUser,
   subscribeProfileUpdates,
   type UserProfile,
 } from '../services/userProfileService'
@@ -28,9 +29,17 @@ function canGoBackInTab(): boolean {
 
 export function TopNavControls() {
   const navigate = useNavigate()
+  const { profile: authProfile, logout } = useAuth()
   const menuRef = useRef<HTMLDivElement>(null)
-  const [profile, setProfile] = useState<UserProfile>(() => getUserProfile())
+  const [profile, setProfile] = useState<UserProfile>(
+    () => authProfile ?? getUserProfile(),
+  )
   const [menuOpen, setMenuOpen] = useState(false)
+  const [signingOut, setSigningOut] = useState(false)
+
+  useEffect(() => {
+    setProfile(authProfile)
+  }, [authProfile])
 
   useEffect(() => {
     return subscribeProfileUpdates(() => {
@@ -76,10 +85,15 @@ export function TopNavControls() {
     navigate(path)
   }
 
-  function handleSignOut() {
+  async function handleSignOut() {
+    if (signingOut) return
+    setSigningOut(true)
     setMenuOpen(false)
-    signOutUser()
-    navigate('/')
+    try {
+      await logout()
+    } finally {
+      setSigningOut(false)
+    }
   }
 
   return (
@@ -159,6 +173,21 @@ export function TopNavControls() {
             <button
               type="button"
               role="menuitem"
+              onClick={() => goTo('/pulse')}
+              className="flex w-full items-center gap-2.5 px-3.5 py-2.5 text-left text-sm text-[#F8FAFC] transition-colors hover:bg-white/5 hover:text-cyan-300"
+            >
+              <Activity
+                className="h-4 w-4 text-[#22d3ee]"
+                strokeWidth={ICON_STROKE}
+              />
+              <span className="flex-1">Meu Pulso</span>
+              <span className="rounded-md border border-cyan-400/25 bg-cyan-400/10 px-1.5 py-0.5 text-[9px] font-bold tracking-wider text-cyan-300">
+                STATS
+              </span>
+            </button>
+            <button
+              type="button"
+              role="menuitem"
               onClick={() => goTo('/profile?edit=true')}
               className="flex w-full items-center gap-2.5 px-3.5 py-2.5 text-left text-sm text-[#F8FAFC] transition-colors hover:bg-white/5 hover:text-cyan-300"
             >
@@ -188,15 +217,13 @@ export function TopNavControls() {
             <button
               type="button"
               role="menuitem"
-              onClick={handleSignOut}
-              className="flex w-full items-center gap-2.5 px-3.5 py-2.5 text-left text-sm text-red-400/90 transition-colors hover:bg-red-500/10 hover:text-red-300"
+              onClick={() => void handleSignOut()}
+              disabled={signingOut}
+              className="flex w-full items-center gap-2.5 px-3.5 py-2.5 text-left text-sm text-red-400/90 transition-colors hover:bg-red-500/10 hover:text-red-300 disabled:opacity-60"
             >
               <LogOut className="h-4 w-4" strokeWidth={ICON_STROKE} />
-              Sair
+              {signingOut ? 'Saindo…' : 'Sair'}
             </button>
-            <p className="px-3.5 py-2 text-[11px] font-medium tracking-wide text-cyan-400/80">
-              Modo Local (Mock)
-            </p>
           </div>
         )}
         </div>

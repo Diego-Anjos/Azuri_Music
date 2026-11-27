@@ -13,6 +13,8 @@ export type UserTrack = {
   durationMs: number
   lyrics: string
   plays: number
+  /** Link opcional do videoclipe oficial (YouTube). */
+  videoUrl?: string
 }
 
 export type UserRelease = {
@@ -82,6 +84,7 @@ function normalizeTrack(track: UserTrack, index: number): UserTrack {
         : 0,
     lyrics: track.lyrics?.trim() || '',
     plays: typeof track.plays === 'number' ? track.plays : 0,
+    videoUrl: track.videoUrl?.trim() || undefined,
   }
 }
 
@@ -256,6 +259,7 @@ export function userTrackToPlayerTrack(
   } | null
   duration_ms?: number
   audioUrl?: string
+  videoUrl?: string
 } {
   const artists = [{ name: release.artistName }]
   if (track.featArtists.trim()) {
@@ -270,6 +274,7 @@ export function userTrackToPlayerTrack(
     artists,
     duration_ms: track.durationMs,
     audioUrl: track.audioUrl,
+    videoUrl: track.videoUrl,
     album: {
       id: release.id,
       name: release.title,
